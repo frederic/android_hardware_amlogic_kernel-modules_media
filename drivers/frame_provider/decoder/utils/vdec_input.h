@@ -21,8 +21,6 @@
 struct vdec_s;
 struct vdec_input_s;
 
-typedef void (*chunk_free)(void *priv, u32 handle);
-
 struct vframe_block_list_s {
 	u32 magic;
 	int id;
@@ -39,11 +37,6 @@ struct vframe_block_list_s {
 	int chunk_count;
 	int is_out_buf;
 	u32 handle;
-	ulong mem_handle;
-	/* free callback */
-	chunk_free free;
-	void* priv;
-
 	struct vdec_input_s *input;
 };
 
@@ -63,8 +56,6 @@ struct vframe_chunk_s {
 	bool timestamp_valid;
 	u64 sequence;
 	struct vframe_block_list_s *block;
-	u32 hdr10p_data_size;
-	char *hdr10p_data_buf;
 };
 
 #define VDEC_INPUT_TARGET_VLD           0
@@ -89,9 +80,8 @@ struct vdec_input_s {
 	bool swap_valid;
 	bool swap_needed;
 	bool eos;
-	ulong mem_handle;
-	void *swap_page;
-	dma_addr_t swap_page_phys;
+	struct page *swap_page;
+	unsigned long swap_page_phys;
 	u64 total_wr_count;
 	u64 total_rd_count;
 	u64 streaming_rp;
@@ -153,9 +143,6 @@ extern int vdec_input_set_buffer(struct vdec_input_s *input, u32 start,
 extern int vdec_input_add_frame(struct vdec_input_s *input, const char *buf,
 	size_t count);
 
-extern int vdec_input_add_frame_with_dma(struct vdec_input_s *input, ulong addr,
-	size_t count, u32 handle, chunk_free free, void* priv);
-
 /* Peek next frame data from decoder's input */
 extern struct vframe_chunk_s *vdec_input_next_chunk(
 			struct vdec_input_s *input);
@@ -180,7 +167,7 @@ extern void vdec_input_unlock(struct vdec_input_s *input, unsigned long lock);
 extern void vdec_input_release(struct vdec_input_s *input);
 /* return block handle and free block */
 extern u32 vdec_input_get_freed_handle(struct vdec_s *vdec);
-int vdec_input_dump_chunks(int id, struct vdec_input_s *input,
+int vdec_input_dump_chunks(struct vdec_input_s *input,
 	char *bufs, int size);
 int vdec_input_dump_blocks(struct vdec_input_s *input,
 	char *bufs, int size);

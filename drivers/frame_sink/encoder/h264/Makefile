@@ -1,1 +1,1 @@
-obj-m	+=	encoder.o
+obj-$(CONFIG_AMLOGIC_MEDIA_VENC_H264)	+=	encoder.o

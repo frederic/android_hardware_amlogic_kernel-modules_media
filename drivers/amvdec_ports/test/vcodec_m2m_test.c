@@ -25,11 +25,9 @@
 #include <pthread.h>
 #include <unistd.h>
 #include <sys/stat.h>
-#include <pthread.h>
 
 #define INBUF_SIZE	(4096)
 #define DUMP_DIR	"/data/video_frames"
-static int dump;
 
 typedef struct VcodecCtx {
 	AVFormatContext *fmt_ctx;
@@ -42,19 +40,19 @@ typedef struct VcodecCtx {
 	pthread_cond_t pthread_cond;
 } VcodecCtx;
 
-static void dump_yuv(AVFrame *frame, char *filename)
+static void pgm_save(unsigned char *buf, int wrap, int xsize, int ysize,
+                     char *filename)
 {
 	FILE *f;
+	int i;
 
-	printf("name: %s, resolution: %dx%d, size: %d\n",
-		filename, frame->width, frame->height,
-		frame->buf[0]->size + frame->buf[1]->size);
+	printf("wrap: %d, xsize: %d, ysize: %d, filename: %s\n", wrap, xsize, ysize, filename);
 
 	f = fopen(filename,"w+");
+	fprintf(f, "P5\n%d %d\n%d\n", xsize, ysize, 255);
 
-	fwrite(frame->buf[0]->data, 1, frame->buf[0]->size, f);
-	fwrite(frame->buf[1]->data, 1, frame->buf[1]->size, f);
-
+	for (i = 0; i < ysize; i++)
+		fwrite(buf + i * wrap, 1, xsize, f);
 	fclose(f);
 }
 
@@ -84,9 +82,8 @@ static void decode(AVCodecContext *dec_ctx, AVFrame *frame, AVPacket *pkt,
 
 		/* the picture is allocated by the decoder. no need to free it */
 		snprintf(buf, sizeof(buf), "%s/frame-%d", filename, dec_ctx->frame_number);
-
-		if (dump)
-			dump_yuv(frame, buf);
+		pgm_save(frame->data[0], frame->linesize[0],
+			frame->width, frame->height, buf);
 	}
 }
 
@@ -103,26 +100,25 @@ static void* read_thread(void *arg)
 	int has_video = 0;
 	unsigned int st_idx = 0;
 	VcodecCtx *vctx = arg;
-	const char *forced_codec_name = NULL;
 
 	printf("entry read thread, tid: %ld.\n", vctx->tid);
 
 	ic = avformat_alloc_context();
 	if (!ic) {
 		fprintf(stderr, "Could not allocate avformat context.\n");
-		goto out;
+		return NULL;
 	}
 
 	err = avformat_open_input(&ic, vctx->filename, NULL, NULL);
 	if (err < 0) {
 		fprintf(stderr, "Could not open avformat input.\n");
-		goto out;
+		return NULL;
 	}
 
 	err = avformat_find_stream_info(ic, NULL);
 	if (err < 0) {
 		fprintf(stderr, "find stream info err.\n");
-		goto out;
+		return NULL;
 	}
 
 	for (st_idx = 0; st_idx < ic->nb_streams; st_idx++) {
@@ -141,59 +137,29 @@ static void* read_thread(void *arg)
 
 	if (!has_video) {
 		fprintf(stderr, "no video stream.\n");
-		goto out;
+		return NULL;
 	}
 
-	stream = ic->streams[vctx->vst_idx];
+        stream = ic->streams[vctx->vst_idx];
 
-	//codec = avcodec_find_decoder(stream->codecpar->codec_id);
-	switch (stream->codecpar->codec_id) {
-		case AV_CODEC_ID_H264:
-			forced_codec_name = "h264_v4l2m2m";
-			break;
-		case AV_CODEC_ID_HEVC:
-			forced_codec_name = "hevc_v4l2m2m";
-			break;
-		case AV_CODEC_ID_VP9:
-			forced_codec_name = "vp9_v4l2m2m";
-			break;
-		case AV_CODEC_ID_MPEG1VIDEO:
-			forced_codec_name = "mpeg1_v4l2m2m";
-			break;
-		case AV_CODEC_ID_MPEG2VIDEO:
-			forced_codec_name = "mpeg2_v4l2m2m";
-			break;
-		case AV_CODEC_ID_VC1:
-			forced_codec_name = "vc1_v4l2m2m";
-			break;
-		case AV_CODEC_ID_H263:
-			forced_codec_name = "h263_v4l2m2m";
-			break;
-		case AV_CODEC_ID_MPEG4:
-			forced_codec_name = "mpeg4_v4l2m2m";
-			break;
-		case AV_CODEC_ID_MJPEG:
-			forced_codec_name = "mjpeg_v4l2m2m";
-			break;
-	}
-
-	codec = avcodec_find_decoder_by_name(forced_codec_name);
-	if (!codec) {
+        //codec = avcodec_find_decoder(stream->codecpar->codec_id);
+	codec = avcodec_find_decoder_by_name("h264_v4l2m2m");
+        if (!codec) {
 		fprintf(stderr, "Unsupported codec with id %d for input stream %d\n",
 			stream->codecpar->codec_id, stream->index);
-		goto out;
-	}
+		return NULL;
+        }
 
 	dec_ctx = avcodec_alloc_context3(codec);
 	if (!dec_ctx) {
 		fprintf(stderr, "Could not allocate video codec context\n");
-		goto out;
+		return NULL;
 	}
 
 	err = avcodec_parameters_to_context(dec_ctx, stream->codecpar);
 	if (err < 0) {
 		fprintf(stderr, "Could not set paras to context\n");
-		goto out;
+		return NULL;
 	}
 
 	av_codec_set_pkt_timebase(dec_ctx, stream->time_base);
@@ -202,7 +168,7 @@ static void* read_thread(void *arg)
 	if (avcodec_open2(dec_ctx, codec, NULL) < 0) {
 		fprintf(stderr, "Could not open codec for input stream %d\n",
 			stream->index);
-		goto out;
+		return NULL;
 	}
 
 	printf("fmt ctx: %p, stream: %p, video st idx: %d, num: %d\n",
@@ -218,7 +184,7 @@ static void* read_thread(void *arg)
 	frame = av_frame_alloc();
 	if (!frame) {
 		fprintf(stderr, "Could not allocate video frame\n");
-		goto out;
+		return NULL;
 	}
 
 	for (;;) {
@@ -238,29 +204,21 @@ static void* read_thread(void *arg)
 
 		if (pkt->stream_index == vctx->vst_idx) {
 			//packet_queue_put(&is->audioq, pkt);
-			//printf("read video data size: %d.\n", pkt->size);
+			printf("read video data size: %d.\n", pkt->size);
 			if (pkt->size)
 				decode(dec_ctx, frame, pkt, DUMP_DIR);
-		}
-
-		av_packet_unref(pkt);
-
-		usleep(8 * 1000);
+		} else
+			av_packet_unref(pkt);
 	}
 
 	/* flush the decoder */
 	decode(dec_ctx, frame, NULL, DUMP_DIR);
-out:
-	if (dec_ctx)
-		avcodec_free_context(&dec_ctx);
 
-	if (frame)
-		av_frame_free(&frame);
+	avcodec_free_context(&dec_ctx);
+	av_frame_free(&frame);
 
-	if (ic) {
+	if (ic)
 	    avformat_close_input(&ic);
-	    avformat_free_context(ic);
-	}
 
 	printf("read thread exit.\n");
 
@@ -270,6 +228,7 @@ out:
 
 	return NULL;
 }
+
 
 static int open_input_file(const char *filename)
 {
@@ -282,10 +241,8 @@ static int open_input_file(const char *filename)
 	    return -1;
 
 	vctx->filename = av_strdup(filename);
-	if (!vctx->filename) {
-	    av_free(vctx);
+	if (!vctx->filename)
 	    return -1;
-	}
 
 	pthread_mutex_init(&vctx->pthread_mutex, NULL);
 	pthread_cond_init(&vctx->pthread_cond, NULL);
@@ -296,12 +253,8 @@ static int open_input_file(const char *filename)
 
 		pthread_mutex_lock(&vctx->pthread_mutex);
 		pthread_cond_wait(&vctx->pthread_cond, &vctx->pthread_mutex);
-		pthread_join(vctx->tid, NULL);
 		pthread_mutex_unlock(&vctx->pthread_mutex);
 	}
-
-	av_free(vctx->filename);
-	av_free(vctx);
 
 	printf("creat the read thread, ret: %d.\n", ret);
 
@@ -311,33 +264,29 @@ static int open_input_file(const char *filename)
 int main(int argc, char **argv)
 {
 	int ret;
-	const char *filename;
-	int log_level = 0;
+	const char *filename, *outfilename;
 
 	if (argc < 2) {
 		fprintf(stderr, "Usage: %s <input file>\n ==> %s/frame-123\n", argv[0], DUMP_DIR);
 		exit(0);
 	}
 
-	filename = argv[1];
-	if (argv[2]) {
-		if (!strcmp(argv[2], "dump"))
-			dump = 1;
-		else
-			log_level = atoi(argv[2]);
-	}
+	filename    = argv[1];
+	outfilename = argv[2];
 
 	mkdir(DUMP_DIR, 0664);
 
 	/*set debug level*/
-	av_log_set_level(log_level); //AV_LOG_DEBUG
+	//av_log_set_level(AV_LOG_DEBUG);
 
-	/* register all the codecs */
-	avcodec_register_all();
+	av_register_all();
 
 	ret = open_input_file(filename);
-	if (ret < 0)
+	if (ret < 0) {
 		fprintf(stderr, "open input file fail.\n");
+		goto out;
+	}
 
-	return 0;
+out:
+	return ret < 0;
 }

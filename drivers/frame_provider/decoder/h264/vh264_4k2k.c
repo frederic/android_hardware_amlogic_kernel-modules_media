@@ -59,6 +59,7 @@
 #include <linux/amlogic/media/codec_mm/codec_mm.h>
 #include <linux/amlogic/media/codec_mm/configs.h>
 
+#include <trace/events/meson_atrace.h>
 
 
 #if  0 /* MESON_CPU_TYPE == MESON_CPU_TYPE_MESON6TVD */
@@ -683,7 +684,6 @@ static irqreturn_t vh264_4k2k_isr(int irq, void *dev_id)
 	unsigned int stream_offset;
 	struct vframe_s *vf = NULL;
 	int ret = READ_VREG(MAILBOX_COMMAND);
-	u32 frame_size;
 
 	switch (ret & 0xff) {
 	case CMD_ALLOC_VIEW:
@@ -720,7 +720,6 @@ static irqreturn_t vh264_4k2k_isr(int irq, void *dev_id)
 				ret = pts_lookup_offset_us64(PTS_TYPE_VIDEO,
 							stream_offset,
 							&vf->pts,
-							&frame_size,
 							0,
 							&vf->pts_us64);
 				if (ret != 0)

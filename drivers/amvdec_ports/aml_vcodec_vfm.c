@@ -23,9 +23,6 @@
 #include "aml_vcodec_adapt.h"
 #include <media/v4l2-mem2mem.h>
 
-#define KERNEL_ATRACE_TAG KERNEL_ATRACE_TAG_VIDEO_COMPOSER
-#include <trace/events/meson_atrace.h>
-
 #define RECEIVER_NAME	"v4l2-video"
 #define PROVIDER_NAME	"v4l2-video"
 
@@ -56,7 +53,7 @@ static void vdec_vf_put(struct vframe_s *vf, void *op_arg)
 	//vf_notify_provider(vfm->recv_name, VFRAME_EVENT_RECEIVER_PUT, NULL);
 
 	if (vfq_level(&vfm->vf_que_recycle) > POOL_SIZE - 1) {
-		v4l_dbg(vfm->ctx, V4L_DEBUG_CODEC_ERROR, "vfq full.\n");
+		pr_info("%s %d vfq full.\n", __func__, __LINE__);
 		return;
 	}
 
@@ -90,20 +87,13 @@ static int vdec_vf_states(struct vframe_states *states, void *op_arg)
 	return 0;
 }
 
-void video_vf_put(char *receiver, struct vdec_v4l2_buffer *fb, int id)
+void video_vf_put(char *receiver, struct vdec_fb *fb, int id)
 {
 	struct vframe_provider_s *vfp = vf_get_provider(receiver);
 	struct vframe_s *vf = (struct vframe_s *)fb->vf_handle;
 
-	ATRACE_COUNTER("v4l2_to", vf->index_disp);
-
-	v4l_dbg(0, V4L_DEBUG_CODEC_OUTPUT,
-		"[%d]: TO   (%s) vf: %p, idx: %d, "
-		"Y:(%lx, %u) C/U:(%lx, %u) V:(%lx, %u)\n",
-		id, vfp->name, vf, vf->index,
-		fb->m.mem[0].addr, fb->m.mem[0].size,
-		fb->m.mem[1].addr, fb->m.mem[1].size,
-		fb->m.mem[2].addr, fb->m.mem[2].size);
+	aml_v4l2_debug(2, "[%d] TO   (%s) vf: %p, idx: %d",
+		id, vfp->name, vf, vf->index);
 
 	if (vfp && vf && atomic_dec_and_test(&vf->use_cnt))
 		vf_put(vf, receiver);
@@ -123,12 +113,13 @@ static int video_receiver_event_fun(int type, void *data, void *private_data)
 	struct vframe_states states;
 	struct vcodec_vfm_s *vfm = (struct vcodec_vfm_s *)private_data;
 
+	//aml_v4l2_debug(4, "[%d] type: %d, vfm: %p", vfm->ctx->id, type, vfm);
+
 	switch (type) {
 	case VFRAME_EVENT_PROVIDER_UNREG: {
 		if (vf_get_receiver(vfm->prov_name)) {
-			v4l_dbg(vfm->ctx, V4L_DEBUG_CODEC_EXINFO,
-				"unreg %s provider.\n",
-				vfm->prov_name);
+			aml_v4l2_debug(4, "[%d] unreg %s provider.",
+				vfm->ctx->id, vfm->prov_name);
 			vf_unreg_provider(&vfm->vf_prov);
 		}
 
@@ -137,9 +128,8 @@ static int video_receiver_event_fun(int type, void *data, void *private_data)
 
 	case VFRAME_EVENT_PROVIDER_START: {
 		if (vf_get_receiver(vfm->prov_name)) {
-			v4l_dbg(vfm->ctx, V4L_DEBUG_CODEC_EXINFO,
-				"reg %s provider.\n",
-				vfm->prov_name);
+			aml_v4l2_debug(4, "[%d] reg %s provider.",
+				vfm->ctx->id, vfm->prov_name);
 			vf_provider_init(&vfm->vf_prov, vfm->prov_name,
 				&vf_provider, vfm);
 			vf_reg_provider(&vfm->vf_prov);
@@ -172,7 +162,7 @@ static int video_receiver_event_fun(int type, void *data, void *private_data)
 			ret = -1;
 
 		if (ret < 0) {
-			v4l_dbg(vfm->ctx, V4L_DEBUG_CODEC_ERROR, "receiver vf err.\n");
+			pr_err("[%d] receiver vf err.\n", vfm->ctx->id);
 			break;
 		}
 
@@ -191,8 +181,7 @@ static int video_receiver_event_fun(int type, void *data, void *private_data)
 	}
 
 	default:
-		v4l_dbg(vfm->ctx, V4L_DEBUG_CODEC_EXINFO,
-			"the vf event is %d", type);
+		aml_v4l2_debug(4, "[%d] the vf event is %d", vfm->ctx->id, type);
 	}
 
 	return ret;
@@ -220,8 +209,6 @@ struct vframe_s *get_video_frame(struct vcodec_vfm_s *vfm)
 
 int vcodec_vfm_init(struct vcodec_vfm_s *vfm)
 {
-	int ret;
-
 	snprintf(vfm->recv_name, VF_NAME_SIZE, "%s-%d",
 		RECEIVER_NAME, vfm->ctx->id);
 	snprintf(vfm->prov_name, VF_NAME_SIZE, "%s-%d",
@@ -230,16 +217,13 @@ int vcodec_vfm_init(struct vcodec_vfm_s *vfm)
 	vfm->ada_ctx->recv_name = vfm->recv_name;
 
 	vf_receiver_init(&vfm->vf_recv, vfm->recv_name, &vf_receiver, vfm);
-	ret = vf_reg_receiver(&vfm->vf_recv);
+	vf_reg_receiver(&vfm->vf_recv);
 
-	vfm->vfm_initialized = ret ? false : true;
-
-	return ret;
+	return 0;
 }
 
 void vcodec_vfm_release(struct vcodec_vfm_s *vfm)
 {
-	if (vfm->vfm_initialized)
-		vf_unreg_receiver(&vfm->vf_recv);
+	vf_unreg_receiver(&vfm->vf_recv);
 }
 

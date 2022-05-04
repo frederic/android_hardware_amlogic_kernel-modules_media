@@ -18,7 +18,7 @@
 #ifndef ADEC_H
 #define ADEC_H
 
-#include "../amports/streambuf.h"
+#include "../parser/streambuf.h"
 #include <linux/amlogic/media/utils/aformat.h>
 
 extern s32 adec_init(struct stream_port_s *port);

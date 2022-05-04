@@ -64,9 +64,6 @@ struct gate_switch_node gates[] = {
 	{
 		.name = "asyncfifo",
 	},
-	{
-		.name = "clk_hevcf_mux",
-	},
 };
 
 /*

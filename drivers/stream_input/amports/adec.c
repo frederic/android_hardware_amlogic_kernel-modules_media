@@ -25,7 +25,7 @@
 #include <linux/amlogic/media/frame_sync/ptsserv.h>
 #include <linux/amlogic/media/registers/register.h>
 #include <linux/amlogic/media/codec_mm/configs.h>
-#include "../amports/streambuf.h"
+#include "../parser/streambuf.h"
 #include <linux/module.h>
 #include <linux/of.h>
 #include "amports_priv.h"
@@ -121,14 +121,13 @@ static ssize_t datawidth_show(struct class *class,
 static ssize_t pts_show(struct class *class, struct class_attribute *attr,
 						char *buf)
 {
-	u32 pts, frame_size;
+	u32 pts;
 	u32 pts_margin = 0;
 
 	if (astream_dev->samplerate <= 12000)
 		pts_margin = 512;
 
-	if (INFO_VALID && (pts_lookup(PTS_TYPE_AUDIO, &pts,
-			&frame_size, pts_margin) >= 0))
+	if (INFO_VALID && (pts_lookup(PTS_TYPE_AUDIO, &pts, pts_margin) >= 0))
 		return sprintf(buf, "0x%x\n", pts);
 	else
 		return sprintf(buf, "%s\n", na_string);
@@ -341,8 +340,7 @@ s32 astream_dev_register(void)
 		goto err_2;
 	}
 
-	if (AM_MESON_CPU_MAJOR_ID_TXL < get_cpu_major_id()
-		&& MESON_CPU_MAJOR_ID_GXLX != get_cpu_type()) {
+	if (AM_MESON_CPU_MAJOR_ID_TXL < get_cpu_major_id()) {
 		node = of_find_node_by_path("/codec_io/io_cbus_base");
 		if (!node) {
 			pr_info("No io_cbus_base node found.");

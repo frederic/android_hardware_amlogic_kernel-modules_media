@@ -31,12 +31,9 @@
 #define KERNEL_ATRACE_TAG KERNEL_ATRACE_TAG_VDEC
 #include <trace/events/meson_atrace.h>
 /*#define CONFIG_AM_VDEC_DV*/
-#include "../../../stream_input/amports/streambuf.h"
-#include "../../../stream_input/amports/stream_buffer_base.h"
 
 #include "vdec_input.h"
 #include "frame_check.h"
-#include "vdec_sync.h"
 
 s32 vdec_dev_register(void);
 s32 vdec_dev_unregister(void);
@@ -55,8 +52,6 @@ void vdec_module_exit(void);
 #define DEC_FLAG_HEVC_WORKAROUND 0x01
 
 #define VDEC_FIFO_ALIGN 8
-
-#define VDEC_FCC_SUPPORT
 
 enum vdec_type_e {
 	VDEC_1 = 0,
@@ -113,19 +108,6 @@ enum vdec_fr_hint_state {
 	VDEC_NEED_HINT,
 	VDEC_HINTED,
 };
-
-#ifdef VDEC_FCC_SUPPORT
-typedef enum {
-	DISCARD_STATUS = 1,
-	AGAIN_STATUS,
-	WAIT_MSG_STATUS,
-	SWITCHING_STATUS,
-	JUMP_BACK_STATUS,
-	SWITCH_DONE_STATUS,
-	STATUS_BUTT
-} FCC_STATUS;
-#endif
-
 extern s32 vdec_request_threaded_irq(enum vdec_irq_num num,
 			irq_handler_t handler,
 			irq_handler_t thread_fn,
@@ -139,15 +121,7 @@ extern void dma_contiguous_early_fixup(phys_addr_t base, unsigned long size);
 unsigned int get_vdec_clk_config_settings(void);
 void update_vdec_clk_config_settings(unsigned int config);
 //unsigned int get_mmu_mode(void);//DEBUG_TMP
-//extern void vdec_fill_frame_info(struct vframe_qos_s *vframe_qos, int debug);
-extern void vdec_fill_vdec_frame(struct vdec_s *vdec,
-				struct vframe_qos_s *vframe_qos,
-				struct vdec_info *vinfo,
-				struct vframe_s *vf, u32 hw_dec_time);
-
-extern void vdec_vframe_ready(struct vdec_s *vdec, struct vframe_s *vf);
-extern void vdec_set_vframe_comm(struct vdec_s *vdec, char *n);
-
+extern void vdec_fill_frame_info(struct vframe_qos_s *vframe_qos, int debug);
 
 struct vdec_s;
 enum vformat_t;
@@ -198,7 +172,6 @@ struct vdec_s {
 	struct vdec_s *master;
 	struct vdec_s *slave;
 	struct stream_port_s *port;
-	struct stream_buf_s vbuf;
 	int status;
 	int next_status;
 	int type;
@@ -252,6 +225,11 @@ struct vdec_s {
 	bool is_reset;
 	bool dolby_meta_with_el;
 
+	/*start time, needed by google libplay*/
+	unsigned int start_time;
+	bool enable_start_time;
+
+
 	/* canvas */
 	int (*get_canvas)(unsigned int index, unsigned int base);
 	int (*get_canvas_ex)(int type, int id);
@@ -261,7 +239,7 @@ struct vdec_s {
 	int (*set_trickmode)(struct vdec_s *vdec, unsigned long trickmode);
 	int (*set_isreset)(struct vdec_s *vdec, int isreset);
 	void (*vdec_fps_detec)(int id);
-
+	int (*set_starttime)(struct vdec_s *vdec, unsigned int starttime);
 	unsigned long (*run_ready)(struct vdec_s *vdec, unsigned long mask);
 	void (*run)(struct vdec_s *vdec, unsigned long mask,
 			void (*callback)(struct vdec_s *, void *), void *);
@@ -274,9 +252,6 @@ struct vdec_s {
 			struct userdata_param_t *puserdata_para);
 	void (*reset_userdata_fifo)(struct vdec_s *vdec, int bInit);
 	void (*wakeup_userdata_poll)(struct vdec_s *vdec);
-#ifdef VDEC_FCC_SUPPORT
-	void (*wakeup_fcc_poll)(struct vdec_s *vdec);
-#endif
 	/* private */
 	void *private;       /* decoder per instance specific data */
 #ifdef VDEC_DEBUG_SUPPORT
@@ -289,31 +264,9 @@ struct vdec_s {
 	u64 run_clk[VDEC_MAX];
 	u64 start_run_clk[VDEC_MAX];
 #endif
-	u64 irq_thread_cnt;
-	u64 irq_cnt;
+	atomic_t inirq_thread_flag;
+	atomic_t inirq_flag;
 	int parallel_dec;
-	struct vdec_frames_s *mvfrm;
-	struct vdec_sync sync;
-
-	/*aux data check*/
-	struct aux_data_check_mgr_t adc;
-
-	u32 hdr10p_data_size;
-	char hdr10p_data_buf[PAGE_SIZE];
-	bool hdr10p_data_valid;
-	u32 profile_idc;
-	u32 level_idc;
-#ifdef VDEC_FCC_SUPPORT
-	enum fcc_mode_e fcc_mode;
-	u32 stream_offset;
-	int fcc_new_msg;
-	FCC_STATUS fcc_status;
-	wait_queue_head_t jump_back_wq;
-	struct mutex jump_back_mutex;
-	u32 jump_back_done;
-	u32 jump_back_error;
-	u32 jump_back_rp;
-#endif
 };
 
 /* common decoder vframe provider name to use default vfm path */
@@ -365,9 +318,6 @@ extern int vdec_set_receive_id(struct vdec_s *vdec, int receive_id);
 /* add frame data to input chain */
 extern int vdec_write_vframe(struct vdec_s *vdec, const char *buf,
 				size_t count);
-
-extern int vdec_write_vframe_with_dma(struct vdec_s *vdec,
-	ulong addr, size_t count, u32 handle, chunk_free free, void* priv);
 
 /* mark the vframe_chunk as consumed */
 extern void vdec_vframe_dirty(struct vdec_s *vdec,
@@ -436,6 +386,9 @@ extern int vdec_set_dv_metawithel(struct vdec_s *vdec, int isdvmetawithel);
 extern void vdec_set_no_powerdown(int flag);
 
 extern int vdec_is_support_4k(void);
+//needed by google libplay
+extern int vdec_set_starttime(struct vdec_s *vdec, unsigned int starttime);
+
 extern void vdec_set_flag(struct vdec_s *vdec, u32 flag);
 
 extern void vdec_set_eos(struct vdec_s *vdec, bool eos);
@@ -486,19 +439,10 @@ void vdec_reset_userdata_fifo(struct vdec_s *vdec, int bInit);
 
 struct vdec_s *vdec_get_vdec_by_id(int vdec_id);
 
-#ifdef VDEC_FCC_SUPPORT
-int vdec_wakeup_fcc_poll(struct vdec_s *vdec);
-int vdec_has_get_fcc_new_msg(struct vdec_s *vdec);
-int fcc_debug_enable(void);
-#endif
-
 #ifdef VDEC_DEBUG_SUPPORT
 extern void vdec_set_step_mode(void);
 #endif
 int vdec_get_debug_flags(void);
-
-void VDEC_PRINT_FUN_LINENO(const char *fun, int line);
-
 
 unsigned char is_mult_inc(unsigned int);
 
@@ -506,24 +450,8 @@ int vdec_get_status(struct vdec_s *vdec);
 
 void vdec_set_timestamp(struct vdec_s *vdec, u64 timestamp);
 
-extern u32  vdec_get_frame_vdec(struct vdec_s *vdec,  struct vframe_counter_s *tmpbuf);
+extern struct vframe_qos_s *vdec_get_qos_info(void);
 
 int vdec_get_frame_num(struct vdec_s *vdec);
-
-int show_stream_buffer_status(char *buf,
-	int (*callback) (struct stream_buf_s *, char *));
-
-bool is_support_no_parser(void);
-
-extern u32 timestamp_avsync_counter_get(void);
-
-int vdec_resource_checking(struct vdec_s *vdec);
-
-
-void vdec_set_profile_level(struct vdec_s *vdec, u32 profile_idc, u32 level_idc);
-
-extern void vdec_stream_skip_data(struct vdec_s *vdec, int skip_size);
-void vdec_set_vld_wp(struct vdec_s *vdec, u32 wp);
-void vdec_config_vld_reg(struct vdec_s *vdec, u32 addr, u32 size);
 
 #endif				/* VDEC_H */

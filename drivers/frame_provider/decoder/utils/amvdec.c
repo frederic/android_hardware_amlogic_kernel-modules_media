@@ -393,8 +393,6 @@ s32 optee_load_fw(enum vformat_e type, const char *fw_name)
 	case VFORMAT_AVS:
 		if (!strcmp(name, "avs_no_cabac"))
 			format = VIDEO_DEC_AVS_NOCABAC;
-		else if (!strcmp(name, "avs_multi"))
-			format = VIDEO_DEC_AVS_MULTI;
 		else
 			format = VIDEO_DEC_AVS;
 		break;
@@ -422,11 +420,6 @@ s32 optee_load_fw(enum vformat_e type, const char *fw_name)
 
 	case VFORMAT_AVS2:
 		format = VIDEO_DEC_AVS2_MMU;
-		vdec = OPTEE_VDEC_HEVC;
-		break;
-
-	case VFORMAT_AV1:
-		format = VIDEO_DEC_AV1_MMU;
 		vdec = OPTEE_VDEC_HEVC;
 		break;
 
@@ -1161,9 +1154,8 @@ static void __exit amvdec_exit(void)
 
 module_init(amvdec_init);
 module_exit(amvdec_exit);
-
+#endif
 
 MODULE_DESCRIPTION("Amlogic Video Decoder Utility Driver");
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Tim Yao <timyao@amlogic.com>");
-#endif

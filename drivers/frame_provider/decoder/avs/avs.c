@@ -30,7 +30,7 @@
 #include <linux/amlogic/media/vfm/vframe_receiver.h>
 #include <linux/amlogic/media/vfm/vframe.h>
 #include <linux/amlogic/media/utils/vdec_reg.h>
-#include "../../../stream_input/amports/streambuf_reg.h"
+#include "../../../stream_input/parser/streambuf_reg.h"
 #include "../utils/amvdec.h"
 #include <linux/amlogic/media/registers/register.h>
 #include "../../../stream_input/amports/amports_priv.h"
@@ -121,7 +121,6 @@ int avs_get_debug_flag(void)
 static struct vframe_s *vavs_vf_peek(void *);
 static struct vframe_s *vavs_vf_get(void *);
 static void vavs_vf_put(struct vframe_s *, void *);
-static int vavs_event_cb(int type, void *data, void *private_data);
 static int vavs_vf_states(struct vframe_states *states, void *);
 
 static const char vavs_dec_id[] = "vavs-dev";
@@ -134,7 +133,6 @@ static const struct vframe_operations_s vavs_vf_provider = {
 	.peek = vavs_vf_peek,
 	.get = vavs_vf_get,
 	.put = vavs_vf_put,
-	.event_cb = vavs_event_cb,
 	.vf_states = vavs_vf_states,
 };
 static void *mm_blk_handle;
@@ -153,7 +151,7 @@ static struct vframe_provider_s vavs_vf_prov;
 #define RV_AI_BUFF_START_ADDR	 0x01a00000
 #define LONG_CABAC_RV_AI_BUFF_START_ADDR	 0x00000000
 
-static u32 vf_buf_num = 8;
+static u32 vf_buf_num = 4;
 static u32 vf_buf_num_used;
 static u32 canvas_base = 128;
 #ifdef NV21
@@ -193,7 +191,7 @@ static struct work_struct notify_work;
 static struct work_struct set_clk_work;
 static bool is_reset;
 
-static struct vdec_s *vdec = NULL;
+static struct vdec_s *vdec;
 
 #ifdef AVSP_LONG_CABAC
 static struct work_struct long_cabac_wd_work;
@@ -413,6 +411,7 @@ static void UserDataHandler(void)
 	}
 }
 
+
 #ifdef HANDLE_AVS_IRQ
 static irqreturn_t vavs_isr(int irq, void *dev_id)
 #else
@@ -425,7 +424,6 @@ static void vavs_isr(void)
 	u32 repeat_count;
 	u32 picture_type;
 	u32 buffer_index;
-	u32 frame_size;
 	bool force_interlaced_frame = false;
 	unsigned int pts, pts_valid = 0, offset = 0;
 	u64 pts_us64;
@@ -460,7 +458,6 @@ static void vavs_isr(void)
 			if (debug_flag & AVS_DEBUG_PRINT)
 				pr_info("AVS OFFSET=%x\n", offset);
 			if (pts_lookup_offset_us64(PTS_TYPE_VIDEO, offset, &pts,
-				&frame_size,
 				0, &pts_us64) == 0) {
 				pts_valid = 1;
 #ifdef DEBUG_PTS
@@ -480,7 +477,7 @@ static void vavs_isr(void)
 				(((reg >> 8) & 0x3) << 3) - 1) & 0x1f;
 		else
 			buffer_index =
-				((reg & 0x7) - 1) & 7;
+				((reg & 0x7) - 1) & 3;
 
 		picture_type = (reg >> 3) & 7;
 #ifdef DEBUG_PTS
@@ -525,7 +522,6 @@ static void vavs_isr(void)
 			pic_type = 2;
 			if ((picture_type == I_PICTURE) && pts_valid) {
 				vf->pts = pts;
-				vf->pts_us64 = pts_us64;
 				if ((repeat_count > 1) && avi_flag) {
 					/* next_pts = pts +
 					 *   (vavs_amstream_dec_info.rate *
@@ -539,9 +535,6 @@ static void vavs_isr(void)
 					next_pts = 0;
 			} else {
 				vf->pts = next_pts;
-				if (vf->pts == 0) {
-					vf->pts_us64 = 0;
-				}
 				if ((repeat_count > 1) && avi_flag) {
 					/* vf->duration =
 					 *   vavs_amstream_dec_info.rate *
@@ -583,11 +576,7 @@ static void vavs_isr(void)
 				pr_info("buffer_index %d, canvas addr %x\n",
 					   buffer_index, vf->canvas0Addr);
 			}
-
-			vf->pts = (pts_valid)?pts:0;
-			/*
-			*vf->pts_us64 = (pts_valid) ? pts_us64 : 0;
-			*/
+			vf->pts_us64 = (pts_valid) ? pts_us64 : 0;
 			vfbuf_use[buffer_index]++;
 			vf->mem_handle =
 				decoder_bmmu_box_get_mem_handle(
@@ -611,9 +600,7 @@ static void vavs_isr(void)
 				vf->pts = 0;
 			else
 			vf->pts = next_pts;
-			if (vf->pts == 0) {
-				vf->pts_us64 = 0;
-			}
+
 			if ((repeat_count > 1) && avi_flag) {
 				/* vf->duration = vavs_amstream_dec_info.rate *
 				 *   repeat_count >> 1;
@@ -654,6 +641,7 @@ static void vavs_isr(void)
 				decoder_bmmu_box_get_mem_handle(
 					mm_blk_handle,
 					buffer_index);
+
 			kfifo_put(&display_q,
 					  (const struct vframe_s *)vf);
 			ATRACE_COUNTER(MODULE_NAME, vf->pts);
@@ -691,9 +679,6 @@ static void vavs_isr(void)
 					next_pts = 0;
 			} else {
 				vf->pts = next_pts;
-				if (vf->pts == 0) {
-					vf->pts_us64 = 0;
-				}
 				if ((repeat_count > 1) && avi_flag) {
 					/* vf->duration =
 					 *   vavs_amstream_dec_info.rate *
@@ -723,16 +708,11 @@ static void vavs_isr(void)
 			vf->canvas0Addr = vf->canvas1Addr =
 				index2canvas(buffer_index);
 			vf->type_original = vf->type;
-			vf->pts = (pts_valid)?pts:0;
-			/*
-			*vf->pts_us64 = (pts_valid) ? pts_us64 : 0;
-			*/
+
+			vf->pts_us64 = (pts_valid) ? pts_us64 : 0;
 			if (debug_flag & AVS_DEBUG_PRINT) {
 				pr_info("buffer_index %d, canvas addr %x\n",
-					   buffer_index, vf->canvas0Addr
-					   );
-			 pr_info("PicType = %d, PTS = 0x%x\n",
-				picture_type, vf->pts);
+					   buffer_index, vf->canvas0Addr);
 			}
 
 			vfbuf_use[buffer_index]++;
@@ -740,7 +720,6 @@ static void vavs_isr(void)
 				decoder_bmmu_box_get_mem_handle(
 					mm_blk_handle,
 					buffer_index);
-
 			decoder_do_frame_check(NULL, vf);
 			kfifo_put(&display_q,
 					  (const struct vframe_s *)vf);
@@ -821,20 +800,6 @@ static void vavs_vf_put(struct vframe_s *vf, void *op_arg)
 	if (i < VF_POOL_SIZE)
 		kfifo_put(&recycle_q, (const struct vframe_s *)vf);
 
-}
-
-static int vavs_event_cb(int type, void *data, void *private_data)
-{
-	if (type & VFRAME_EVENT_RECEIVER_REQ_STATE) {
-		struct provider_state_req_s *req =
-			(struct provider_state_req_s *)data;
-		if (req->req_type == REQ_STATE_SECURE && vdec)
-			req->req_result[0] = vdec_secure(vdec);
-		else
-			req->req_result[0] = 0xffffffff;
-	}
-
-	return 0;
 }
 
 int vavs_dec_status(struct vdec_s *vdec, struct vdec_info *vstatus)
@@ -998,14 +963,13 @@ void vavs_recover(void)
 
 	WRITE_VREG(DOS_SW_RESET0, (1 << 9) | (1 << 8));
 	WRITE_VREG(DOS_SW_RESET0, 0);
-	WRITE_VREG(AV_SCRATCH_H, 0);
+
 	if (firmware_sel == 1) {
 		WRITE_VREG(POWER_CTL_VLD, 0x10);
 		WRITE_VREG_BITS(VLD_MEM_VIFIFO_CONTROL, 2,
 			MEM_FIFO_CNT_BIT, 2);
 		WRITE_VREG_BITS(VLD_MEM_VIFIFO_CONTROL, 8,
 			MEM_LEVEL_CNT_BIT, 6);
-		WRITE_VREG(AV_SCRATCH_H, 1); // 8 buf flag to ucode
 	}
 
 
@@ -1108,7 +1072,6 @@ static int vavs_prot_init(void)
 	/*************************************************************/
 
 	r = vavs_canvas_init();
-	WRITE_VREG(AV_SCRATCH_H, 0);
 #ifdef NV21
 		if (firmware_sel == 0) {
 			/* fixed canvas index */
@@ -1126,7 +1089,12 @@ static int vavs_prot_init(void)
 						<< 16)
 				);
 			}
-			WRITE_VREG(AV_SCRATCH_H, 1); // 8 buf flag to ucode
+			/*
+			 *WRITE_VREG(AV_SCRATCH_0, 0x010100);
+			 *WRITE_VREG(AV_SCRATCH_1, 0x040403);
+			 *WRITE_VREG(AV_SCRATCH_2, 0x070706);
+			 *WRITE_VREG(AV_SCRATCH_3, 0x0a0a09);
+			 */
 		}
 #else
 	/* index v << 16 | u << 8 | y */
@@ -1187,11 +1155,10 @@ static int vavs_prot_init(void)
 #ifdef AVSP_LONG_CABAC
 static unsigned char es_write_addr[MAX_CODED_FRAME_SIZE]  __aligned(64);
 #endif
-static void vavs_local_init(bool is_reset)
+static void vavs_local_init(void)
 {
 	int i;
 
-	is_reset = 0;
 	vavs_ratio = vavs_amstream_dec_info.ratio;
 
 	avi_flag = (unsigned long) vavs_amstream_dec_info.param;
@@ -1207,23 +1174,19 @@ static void vavs_local_init(bool is_reset)
 #ifdef DEBUG_PTS
 	pts_hit = pts_missed = pts_i_hit = pts_i_missed = 0;
 #endif
+	INIT_KFIFO(display_q);
+	INIT_KFIFO(recycle_q);
+	INIT_KFIFO(newframe_q);
 
-	if (!is_reset) {
-		INIT_KFIFO(display_q);
-		INIT_KFIFO(recycle_q);
-		INIT_KFIFO(newframe_q);
+	for (i = 0; i < VF_POOL_SIZE; i++) {
+		const struct vframe_s *vf = &vfpool[i];
 
-		for (i = 0; i < VF_POOL_SIZE; i++) {
-			const struct vframe_s *vf = &vfpool[i];
-
-			vfpool[i].index = vf_buf_num;
-			vfpool[i].bufWidth = 1920;
-			kfifo_put(&newframe_q, vf);
-		}
-
-		for (i = 0; i < vf_buf_num; i++)
-			vfbuf_use[i] = 0;
+		vfpool[i].index = vf_buf_num;
+		vfpool[i].bufWidth = 1920;
+		kfifo_put(&newframe_q, vf);
 	}
+	for (i = 0; i < vf_buf_num; i++)
+		vfbuf_use[i] = 0;
 
 	cur_vfpool = vfpool;
 
@@ -1263,7 +1226,7 @@ static void vavs_ppmgr_reset(void)
 {
 	vf_notify_receiver(PROVIDER_NAME, VFRAME_EVENT_PROVIDER_RESET, NULL);
 
-	vavs_local_init(true);
+	vavs_local_init();
 
 	pr_info("vavs: vf_ppmgr_reset\n");
 }
@@ -1272,12 +1235,12 @@ static void vavs_ppmgr_reset(void)
 static void vavs_local_reset(void)
 {
 	mutex_lock(&vavs_mutex);
-	//recover_flag = 1;
+	recover_flag = 1;
 	pr_info("error, local reset\n");
 	amvdec_stop();
 	msleep(100);
 	vf_notify_receiver(PROVIDER_NAME, VFRAME_EVENT_PROVIDER_RESET, NULL);
-	vavs_local_init(true);
+	vavs_local_init();
 	vavs_recover();
 
 
@@ -1314,7 +1277,7 @@ static void vavs_fatal_error_handler(struct work_struct *work)
 		vavs_ppmgr_reset();
 #else
 		vf_light_unreg_provider(&vavs_vf_prov);
-		vavs_local_init(true);
+		vavs_local_init();
 		vf_reg_provider(&vavs_vf_prov);
 #endif
 		vavs_recover();
@@ -1340,6 +1303,8 @@ static void vavs_notify_work(struct work_struct *work)
 
 static void avs_set_clk(struct work_struct *work)
 {
+	if (frame_dur > 0 && saved_resolution !=
+		frame_width * frame_height * (96000 / frame_dur)) {
 		int fps = 96000 / frame_dur;
 
 		saved_resolution = frame_width * frame_height * fps;
@@ -1351,6 +1316,8 @@ static void avs_set_clk(struct work_struct *work)
 			vdec_source_changed(VFORMAT_AVS,
 			frame_width, frame_height, fps);
 		}
+
+	}
 }
 
 static void vavs_put_timer_func(unsigned long arg)
@@ -1372,7 +1339,7 @@ static void vavs_put_timer_func(unsigned long arg)
 				vavs_ppmgr_reset();
 #else
 				vf_light_unreg_provider(&vavs_vf_prov);
-				vavs_local_init(true);
+				vavs_local_init();
 				vf_reg_provider(&vavs_vf_prov);
 #endif
 				vavs_recover();
@@ -1440,11 +1407,10 @@ static void vavs_put_timer_func(unsigned long arg)
 				kfifo_put(&newframe_q,
 						  (const struct vframe_s *)vf);
 		}
+
 	}
 
-	if (frame_dur > 0 && saved_resolution !=
-		frame_width * frame_height * (96000 / frame_dur))
-		schedule_work(&set_clk_work);
+	schedule_work(&set_clk_work);
 
 	timer->expires = jiffies + PUT_INTERVAL;
 
@@ -1578,7 +1544,10 @@ static s32 vavs_init(void)
 	stat |= STAT_TIMER_INIT;
 
 	amvdec_enable();
-	vavs_local_init(false);
+
+	vdec_enable_DMC(NULL);
+
+	vavs_local_init();
 
 	if (get_cpu_major_id() >= AM_MESON_CPU_MAJOR_ID_GXM)
 		size = get_firmware_data(VIDEO_DEC_AVS, buf);
@@ -1690,9 +1659,9 @@ static int amvdec_avs_probe(struct platform_device *pdev)
 		firmware_sel = 1;
 
 	if (firmware_sel == 1) {
-		vf_buf_num = 8;
+		vf_buf_num = 4;
 		canvas_base = 0;
-		canvas_num = 2;
+		canvas_num = 3;
 	} else {
 
 		canvas_base = 128;
@@ -1732,13 +1701,6 @@ static int amvdec_avs_probe(struct platform_device *pdev)
 
 	INIT_WORK(&set_clk_work, avs_set_clk);
 	vdec = pdata;
-
-	INIT_WORK(&fatal_error_wd_work, vavs_fatal_error_handler);
-	atomic_set(&error_handler_run, 0);
-
-	INIT_WORK(&userdata_push_work, userdata_push_do_work);
-	INIT_WORK(&notify_work, vavs_notify_work);
-
 	if (vavs_init() < 0) {
 		pr_info("amvdec_avs init failed.\n");
 		kfree(gvs);
@@ -1746,21 +1708,26 @@ static int amvdec_avs_probe(struct platform_device *pdev)
 		pdata->dec_status = NULL;
 		return -ENODEV;
 	}
+
+	INIT_WORK(&fatal_error_wd_work, vavs_fatal_error_handler);
+	atomic_set(&error_handler_run, 0);
+
+	INIT_WORK(&userdata_push_work, userdata_push_do_work);
+
+	INIT_WORK(&notify_work, vavs_notify_work);
+
 	return 0;
 }
 
 static int amvdec_avs_remove(struct platform_device *pdev)
 {
-	if (stat & STAT_TIMER_ARM) {
-		del_timer_sync(&recycle_timer);
-		stat &= ~STAT_TIMER_ARM;
-	}
 	cancel_work_sync(&fatal_error_wd_work);
 	atomic_set(&error_handler_run, 0);
 
 	cancel_work_sync(&userdata_push_work);
 
 	cancel_work_sync(&notify_work);
+	cancel_work_sync(&set_clk_work);
 	if (stat & STAT_VDEC_RUN) {
 		amvdec_stop();
 		stat &= ~STAT_VDEC_RUN;
@@ -1771,6 +1738,10 @@ static int amvdec_avs_remove(struct platform_device *pdev)
 		stat &= ~STAT_ISR_REG;
 	}
 
+	if (stat & STAT_TIMER_ARM) {
+		del_timer_sync(&recycle_timer);
+		stat &= ~STAT_TIMER_ARM;
+	}
 #ifdef AVSP_LONG_CABAC
 	if (firmware_sel == 0) {
 		mutex_lock(&vavs_mutex);
@@ -1829,8 +1800,8 @@ static int amvdec_avs_remove(struct platform_device *pdev)
 
 
 	amvdec_disable();
-	if (get_cpu_major_id() >= AM_MESON_CPU_MAJOR_ID_TM2)
-		vdec_reset_core(NULL);
+	vdec_disable_DMC(NULL);
+
 	pic_type = 0;
 	if (mm_blk_handle) {
 		decoder_bmmu_box_free(mm_blk_handle);
@@ -1844,39 +1815,17 @@ static int amvdec_avs_remove(struct platform_device *pdev)
 #endif
 	kfree(gvs);
 	gvs = NULL;
-	vdec = NULL;
 
-	cancel_work_sync(&set_clk_work);
 	return 0;
 }
 
 /****************************************/
-#ifdef CONFIG_PM
-static int avs_suspend(struct device *dev)
-{
-	amvdec_suspend(to_platform_device(dev), dev->power.power_state);
-	return 0;
-}
-
-static int avs_resume(struct device *dev)
-{
-	amvdec_resume(to_platform_device(dev));
-	return 0;
-}
-
-static const struct dev_pm_ops avs_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(avs_suspend, avs_resume)
-};
-#endif
 
 static struct platform_driver amvdec_avs_driver = {
 	.probe = amvdec_avs_probe,
 	.remove = amvdec_avs_remove,
 	.driver = {
 		.name = DRIVER_NAME,
-#ifdef CONFIG_PM
-		.pm = &avs_pm_ops,
-#endif
 	}
 };
 

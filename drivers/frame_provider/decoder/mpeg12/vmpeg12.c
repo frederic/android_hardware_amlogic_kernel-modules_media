@@ -43,6 +43,7 @@
 #include <linux/amlogic/media/codec_mm/configs.h>
 #include <linux/amlogic/tee.h>
 
+#include <trace/events/meson_atrace.h>
 
 
 #ifdef CONFIG_AM_VDEC_MPEG12_LOG
@@ -145,7 +146,6 @@ static const struct vframe_operations_s vmpeg_vf_provider = {
 };
 static void *mm_blk_handle;
 static struct vframe_provider_s vmpeg_vf_prov;
-static int tvp_flag;
 
 static DECLARE_KFIFO(newframe_q, struct vframe_s *, VF_POOL_SIZE);
 static DECLARE_KFIFO(display_q, struct vframe_s *, VF_POOL_SIZE);
@@ -176,7 +176,6 @@ static int ccbuf_phyAddress_is_remaped_nocache;
 static u32 lastpts;
 static u32 fr_hint_status;
 static u32 last_offset;
-static u32 ratio_control;
 
 
 static DEFINE_SPINLOCK(lock);
@@ -295,8 +294,6 @@ static void set_frame_info(struct vframe_s *vf)
 
 	else
 		vf->ratio_control = 0;
-
-	ratio_control = vf->ratio_control;
 
 	amlog_level_if(first, LOG_LEVEL_INFO,
 		"mpeg2dec: w(%d), h(%d), dur(%d), dur-ES(%d)\n",
@@ -867,7 +864,6 @@ static irqreturn_t vmpeg12_isr(int irq, void *dev_id)
 	u32 reg, info, seqinfo, offset, pts, pts_valid = 0;
 	struct vframe_s *vf;
 	u64 pts_us64 = 0;
-	u32 frame_size;
 
 	WRITE_VREG(ASSIST_MBOX1_CLR_REG, 1);
 
@@ -884,8 +880,7 @@ static irqreturn_t vmpeg12_isr(int irq, void *dev_id)
 			first_i_frame_ready = 1;
 
 		if ((pts_lookup_offset_us64
-			 (PTS_TYPE_VIDEO, offset, &pts,
-			 &frame_size, 0, &pts_us64) == 0)
+			 (PTS_TYPE_VIDEO, offset, &pts, 0, &pts_us64) == 0)
 			&& (((info & PICINFO_TYPE_MASK) == PICINFO_TYPE_I)
 				|| ((info & PICINFO_TYPE_MASK) ==
 					PICINFO_TYPE_P)))
@@ -1300,7 +1295,8 @@ static void reset_do_work(struct work_struct *work)
 
 static void vmpeg12_set_clk(struct work_struct *work)
 {
-	 {
+	if (frame_dur > 0 && saved_resolution !=
+		frame_width * frame_height * (96000 / frame_dur)) {
 		int fps = 96000 / frame_dur;
 
 		saved_resolution = frame_width * frame_height * fps;
@@ -1364,9 +1360,7 @@ static void vmpeg_put_timer_func(unsigned long arg)
 		}
 	}
 
-	if (frame_dur > 0 && saved_resolution !=
-		frame_width * frame_height * (96000 / frame_dur))
-		schedule_work(&set_clk_work);
+	schedule_work(&set_clk_work);
 
 	timer->expires = jiffies + PUT_INTERVAL;
 
@@ -1396,7 +1390,6 @@ int vmpeg12_dec_status(struct vdec_s *vdec, struct vdec_info *vstatus)
 	vstatus->total_data = gvs->total_data;
 	vstatus->samp_cnt = gvs->samp_cnt;
 	vstatus->offset = gvs->offset;
-	vstatus->ratio_control = ratio_control;
 	snprintf(vstatus->vdec_name, sizeof(vstatus->vdec_name),
 		"%s", DRIVER_NAME);
 
@@ -1754,7 +1747,7 @@ static int vmpeg12_canvas_init(void)
 				ccbuf_phyAddress_virt
 					= codec_mm_phys_to_virt(
 						ccbuf_phyAddress);
-				if ((!ccbuf_phyAddress_virt) && (!tvp_flag)) {
+				if (!ccbuf_phyAddress_virt) {
 					ccbuf_phyAddress_virt
 						= codec_mm_vmap(
 							ccbuf_phyAddress,
@@ -1929,8 +1922,7 @@ static void vmpeg12_local_init(void)
 			MAX_BMMU_BUFFER_NUM,
 			4 + PAGE_SHIFT,
 			CODEC_MM_FLAGS_CMA_CLEAR |
-			CODEC_MM_FLAGS_FOR_VDECODER |
-			tvp_flag);
+			CODEC_MM_FLAGS_FOR_VDECODER);
 
 
 	frame_width = frame_height = frame_dur = frame_prog = 0;
@@ -2052,7 +2044,6 @@ static int amvdec_mpeg12_probe(struct platform_device *pdev)
 		return -EFAULT;
 	}
 
-	tvp_flag = vdec_secure(pdata) ? CODEC_MM_FLAGS_TVP : 0;
 	if (pdata->sys_info)
 		vmpeg12_amstream_dec_info = *pdata->sys_info;
 
@@ -2101,6 +2092,7 @@ static int amvdec_mpeg12_remove(struct platform_device *pdev)
 	cancel_work_sync(&userdata_push_work);
 	cancel_work_sync(&notify_work);
 	cancel_work_sync(&reset_work);
+	cancel_work_sync(&set_clk_work);
 
 	if (stat & STAT_VDEC_RUN) {
 		amvdec_stop();
@@ -2117,7 +2109,6 @@ static int amvdec_mpeg12_remove(struct platform_device *pdev)
 		stat &= ~STAT_TIMER_ARM;
 	}
 
-	cancel_work_sync(&set_clk_work);
 	if (stat & STAT_VF_HOOK) {
 		if (fr_hint_status == VDEC_HINTED)
 			vf_notify_receiver(PROVIDER_NAME,
@@ -2159,32 +2150,16 @@ static int amvdec_mpeg12_remove(struct platform_device *pdev)
 }
 
 /****************************************/
-#ifdef CONFIG_PM
-static int mpeg12_suspend(struct device *dev)
-{
-	amvdec_suspend(to_platform_device(dev), dev->power.power_state);
-	return 0;
-}
-
-static int mpeg12_resume(struct device *dev)
-{
-	amvdec_resume(to_platform_device(dev));
-	return 0;
-}
-
-static const struct dev_pm_ops mpeg12_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(mpeg12_suspend, mpeg12_resume)
-};
-#endif
 
 static struct platform_driver amvdec_mpeg12_driver = {
 	.probe = amvdec_mpeg12_probe,
 	.remove = amvdec_mpeg12_remove,
+#ifdef CONFIG_PM
+	.suspend = amvdec_suspend,
+	.resume = amvdec_resume,
+#endif
 	.driver = {
 		.name = DRIVER_NAME,
-#ifdef CONFIG_PM
-		.pm = &mpeg12_pm_ops,
-#endif
 	}
 };
 

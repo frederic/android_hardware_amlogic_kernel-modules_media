@@ -56,7 +56,7 @@
 #include "../utils/firmware.h"
 #include "../../../common/chips/decoder_cpu_ver_info.h"
 #include <linux/amlogic/tee.h>
-
+#include <trace/events/meson_atrace.h>
 
 #define I_ONLY_SUPPORT
 #define MIX_STREAM_SUPPORT
@@ -74,6 +74,7 @@
 #define HEVCD_MPP_ANC2AXI_TBL_DATA                 0x3464
 #define HEVC_SAO_MMU_VH1_ADDR                      0x363b
 #define HEVC_SAO_MMU_VH0_ADDR                      0x363a
+#define HEVC_SAO_MMU_STATUS                        0x3639
 
 
 /*
@@ -250,23 +251,17 @@ static u32 work_buf_size = 32 * 1024 * 1024;
 
 static u32 mv_buf_margin;
 static int pre_decode_buf_level = 0x1000;
-static u32 again_threshold;
+static u32 again_threshold = 0x40;
 
 
 /* DOUBLE_WRITE_MODE is enabled only when NV21 8 bit output is needed */
-/* double_write_mode:
- *	0, no double write;
- *	1, 1:1 ratio;
- *	2, (1/4):(1/4) ratio;
- *	3, (1/4):(1/4) ratio, with both compressed frame included
- *	4, (1/2):(1/2) ratio;
- *	0x10, double write only
- *	0x100, if > 1080p,use mode 4,else use mode 1;
- *	0x200, if > 1080p,use mode 2,else use mode 1;
- *	0x300, if > 720p, use mode 4, else use mode 1;
- */
+/* double_write_mode: 0, no double write
+					  1, 1:1 ratio
+					  2, (1/4):(1/4) ratio
+					  4, (1/2):(1/2) ratio
+					0x10, double write only
+*/
 static u32 double_write_mode;
-static u32 without_display_mode;
 
 #define DRIVER_NAME "amvdec_avs2"
 #define MODULE_NAME "amvdec_avs2"
@@ -759,11 +754,7 @@ struct AVS2Decoder_s {
 #ifdef I_ONLY_SUPPORT
 	u32 i_only;
 #endif
-	int frameinfo_enable;
-	struct vframe_qos_s vframe_qos;
-	u32 dynamic_buf_margin;
-	int sidebind_type;
-	int sidebind_channel_id;
+
 };
 
 static int  compute_losless_comp_body_size(
@@ -879,56 +870,37 @@ static u32 get_valid_double_write_mode(struct AVS2Decoder_s *dec)
 static int get_double_write_mode(struct AVS2Decoder_s *dec)
 {
 	u32 valid_dw_mode = get_valid_double_write_mode(dec);
-	int w = dec->avs2_dec.img.width;
-	int h = dec->avs2_dec.img.height;
-	u32 dw = 0x1; /*1:1*/
-	switch (valid_dw_mode) {
-	case 0x100:
+	u32 dw;
+	if (valid_dw_mode == 0x100) {
+		int w = dec->avs2_dec.img.width;
+		int h = dec->avs2_dec.img.height;
 		if (w > 1920 && h > 1088)
 			dw = 0x4; /*1:2*/
-		break;
-	case 0x200:
-		if (w > 1920 && h > 1088)
-			dw = 0x2; /*1:4*/
-		break;
-	case 0x300:
-		if (w > 1280 && h > 720)
-			dw = 0x4; /*1:2*/
-		break;
-	default:
-		dw = valid_dw_mode;
-		break;
+		else
+			dw = 0x1; /*1:1*/
+
+		return dw;
 	}
-	return dw;
+
+	return valid_dw_mode;
 }
 
 /* for double write buf alloc */
 static int get_double_write_mode_init(struct AVS2Decoder_s *dec)
 {
 	u32 valid_dw_mode = get_valid_double_write_mode(dec);
-	u32 dw;
-	int w = dec->init_pic_w;
-	int h = dec->init_pic_h;
+	if (valid_dw_mode == 0x100) {
+		u32 dw;
+		int w = dec->init_pic_w;
+		int h = dec->init_pic_h;
+		if (w > 1920 && h > 1088)
+			dw = 0x4; /*1:2*/
+		else
+			dw = 0x1; /*1:1*/
 
-	dw = 0x1; /*1:1*/
-	switch (valid_dw_mode) {
-	case 0x100:
-		if (w > 1920 && h > 1088)
-			dw = 0x4; /*1:2*/
-		break;
-	case 0x200:
-		if (w > 1920 && h > 1088)
-			dw = 0x2; /*1:4*/
-		break;
-	case 0x300:
-		if (w > 1280 && h > 720)
-			dw = 0x4; /*1:2*/
-		break;
-	default:
-		dw = valid_dw_mode;
-		break;
+		return dw;
 	}
-	return dw;
+	return valid_dw_mode;
 }
 
 static int get_double_write_ratio(struct AVS2Decoder_s *dec,
@@ -3101,11 +3073,6 @@ static void config_sao_hw(struct AVS2Decoder_s *dec)
 #endif
 	}
 #endif
-	if (get_double_write_mode(dec) == 0)
-		data32 |= 0x2; /*disable double write*/
-	else if (get_double_write_mode(dec) & 0x10)
-		data32 |= 0x1; /*disable cm*/
-
 	WRITE_VREG(HEVC_SAO_CTRL1, data32);
 
 	if (get_double_write_mode(dec) & 0x10) {
@@ -3794,9 +3761,10 @@ static void avs2_local_uninit(struct AVS2Decoder_s *dec)
 	dec->rpm_ptr = NULL;
 	dec->lmem_ptr = NULL;
 	if (dec->rpm_addr) {
-		dma_free_coherent(amports_get_dma_device(),
-						RPM_BUF_SIZE, dec->rpm_addr,
-						dec->rpm_phy_addr);
+		dma_unmap_single(amports_get_dma_device(),
+			dec->rpm_phy_addr, RPM_BUF_SIZE,
+				DMA_FROM_DEVICE);
+		kfree(dec->rpm_addr);
 		dec->rpm_addr = NULL;
 	}
 	if (dec->lmem_addr) {
@@ -3893,7 +3861,7 @@ static int avs2_local_init(struct AVS2Decoder_s *dec)
 #ifndef AVS2_10B_MMU
 	init_buf_list(dec);
 #else
-	dec->used_buf_num = max_buf_num + dec->dynamic_buf_margin;
+	dec->used_buf_num = max_buf_num;
 	if (dec->used_buf_num > MAX_BUF_NUM)
 		dec->used_buf_num = MAX_BUF_NUM;
 	if (dec->used_buf_num > FRAME_BUFFERS)
@@ -3906,15 +3874,25 @@ static int avs2_local_init(struct AVS2Decoder_s *dec)
 			& 0x40) >> 6;
 
 	if ((debug & AVS2_DBG_SEND_PARAM_WITH_REG) == 0) {
-		dec->rpm_addr = dma_alloc_coherent(amports_get_dma_device(),
-			RPM_BUF_SIZE,
-			&dec->rpm_phy_addr, GFP_KERNEL);
+		dec->rpm_addr = kmalloc(RPM_BUF_SIZE, GFP_KERNEL);
 		if (dec->rpm_addr == NULL) {
 			pr_err("%s: failed to alloc rpm buffer\n", __func__);
 			return -1;
 		}
-		avs2_print(dec, AVS2_DBG_BUFMGR,
-			"rpm_phy_addr %x\n", (u32) dec->rpm_phy_addr);
+
+		dec->rpm_phy_addr = dma_map_single(amports_get_dma_device(),
+			dec->rpm_addr, RPM_BUF_SIZE, DMA_FROM_DEVICE);
+		if (dma_mapping_error(amports_get_dma_device(),
+			dec->rpm_phy_addr)) {
+			pr_err("%s: failed to map rpm buffer\n", __func__);
+			kfree(dec->rpm_addr);
+			dec->rpm_addr = NULL;
+			return -1;
+		} else {
+			avs2_print(dec, AVS2_DBG_BUFMGR,
+				"rpm_phy_addr %x\n", (u32) dec->rpm_phy_addr);
+		}
+
 		dec->rpm_ptr = dec->rpm_addr;
 	}
 
@@ -3928,7 +3906,17 @@ static int avs2_local_init(struct AVS2Decoder_s *dec)
 		avs2_print(dec, AVS2_DBG_BUFMGR,
 			"%s, lmem_phy_addr %x\n",
 			__func__, (u32)dec->lmem_phy_addr);
-
+/*
+	dec->lmem_phy_addr = dma_map_single(amports_get_dma_device(),
+		dec->lmem_addr, LMEM_BUF_SIZE, DMA_BIDIRECTIONAL);
+	if (dma_mapping_error(amports_get_dma_device(),
+		dec->lmem_phy_addr)) {
+		pr_err("%s: failed to map lmem buffer\n", __func__);
+		kfree(dec->lmem_addr);
+		dec->lmem_addr = NULL;
+		return -1;
+	}
+*/
 	dec->lmem_ptr = dec->lmem_addr;
 
 
@@ -3941,6 +3929,15 @@ static int avs2_local_init(struct AVS2Decoder_s *dec)
 		return -1;
 	}
 	memset(dec->frame_mmu_map_addr, 0, get_frame_mmu_map_size(dec));
+/*	dec->frame_mmu_map_phy_addr = dma_map_single(amports_get_dma_device(),
+	dec->frame_mmu_map_addr, FRAME_MMU_MAP_SIZE, DMA_BIDIRECTIONAL);
+	if (dma_mapping_error(amports_get_dma_device(),
+	dec->frame_mmu_map_phy_addr)) {
+		pr_err("%s: failed to map count_buffer\n", __func__);
+		kfree(dec->frame_mmu_map_addr);
+		dec->frame_mmu_map_addr = NULL;
+		return -1;
+	}*/
 #endif
 
 	ret = 0;
@@ -4062,9 +4059,6 @@ static void set_frame_info(struct AVS2Decoder_s *dec, struct vframe_s *vf)
 	ar = min_t(u32, dec->frame_ar, DISP_RATIO_ASPECT_RATIO_MAX);
 	vf->ratio_control = (ar << DISP_RATIO_ASPECT_RATIO_BIT);
 
-	vf->sidebind_type = dec->sidebind_type;
-	vf->sidebind_channel_id = dec->sidebind_channel_id;
-
 	return;
 }
 
@@ -4146,7 +4140,7 @@ static struct vframe_s *vavs2_vf_get(void *op_arg)
 
 	if (kfifo_get(&dec->display_q, &vf)) {
 		uint8_t index = vf->index & 0xff;
-		if (index < dec->used_buf_num) {
+		if (index >= 0 && index < dec->used_buf_num) {
 			struct avs2_frame_s *pic = get_pic_by_index(dec, index);
 			if (pic == NULL &&
 				(debug & AVS2_DBG_PIC_LEAK)) {
@@ -4184,15 +4178,10 @@ static struct vframe_s *vavs2_vf_get(void *op_arg)
 static void vavs2_vf_put(struct vframe_s *vf, void *op_arg)
 {
 	struct AVS2Decoder_s *dec = (struct AVS2Decoder_s *)op_arg;
-	uint8_t index;
+	uint8_t index = vf->index & 0xff;
 
 	if (vf == (&dec->vframe_dummy))
 		return;
-
-	if (!vf)
-		return;
-
-	index = vf->index & 0xff;
 
 	kfifo_put(&dec->newframe_q, (const struct vframe_s *)vf);
 	dec->vf_put_count++;
@@ -4201,7 +4190,8 @@ static void vavs2_vf_put(struct vframe_s *vf, void *op_arg)
 		__func__, vf->index,
 		dec->vf_put_count);
 
-	if (index < dec->used_buf_num) {
+	if (index >= 0
+		&& index < dec->used_buf_num) {
 		unsigned long flags;
 		struct avs2_frame_s *pic;
 
@@ -4231,17 +4221,6 @@ static void vavs2_vf_put(struct vframe_s *vf, void *op_arg)
 
 static int vavs2_event_cb(int type, void *data, void *private_data)
 {
-	struct AVS2Decoder_s *dec = (struct AVS2Decoder_s *)private_data;
-
-	if (type & VFRAME_EVENT_RECEIVER_REQ_STATE) {
-		struct provider_state_req_s *req =
-			(struct provider_state_req_s *)data;
-		if (req->req_type == REQ_STATE_SECURE)
-			req->req_result[0] = vdec_secure(hw_to_vdec(dec));
-		else
-			req->req_result[0] = 0xffffffff;
-	}
-
 	return 0;
 }
 
@@ -4267,74 +4246,12 @@ static struct avs2_frame_s *get_disp_pic(struct AVS2Decoder_s *dec)
 
 }
 
-
-
-static void fill_frame_info(struct AVS2Decoder_s *dec,
-	struct avs2_frame_s *pic, unsigned int framesize, unsigned int pts)
-{
-	struct vframe_qos_s *vframe_qos = &dec->vframe_qos;
-
-	if (pic->slice_type == I_IMG)
-		vframe_qos->type = 1;
-	else if (pic->slice_type == P_IMG)
-		vframe_qos->type = 2;
-	else if (pic->slice_type == B_IMG)
-		vframe_qos->type = 3;
-/*
-#define SHOW_QOS_INFO
-*/
-	if (input_frame_based(hw_to_vdec(dec)))
-		vframe_qos->size = pic->frame_size;
-	else
-		vframe_qos->size = framesize;
-	vframe_qos->pts = pts;
-#ifdef SHOW_QOS_INFO
-	avs2_print(dec, 0, "slice:%d\n", pic->slice_type);
-#endif
-
-
-	vframe_qos->max_mv = pic->max_mv;
-	vframe_qos->avg_mv = pic->avg_mv;
-	vframe_qos->min_mv = pic->min_mv;
-#ifdef SHOW_QOS_INFO
-	avs2_print(dec, 0, "mv: max:%d,  avg:%d, min:%d\n",
-			vframe_qos->max_mv,
-			vframe_qos->avg_mv,
-			vframe_qos->min_mv);
-#endif
-
-	vframe_qos->max_qp = pic->max_qp;
-	vframe_qos->avg_qp = pic->avg_qp;
-	vframe_qos->min_qp = pic->min_qp;
-#ifdef SHOW_QOS_INFO
-	avs2_print(dec, 0, "qp: max:%d,  avg:%d, min:%d\n",
-			vframe_qos->max_qp,
-			vframe_qos->avg_qp,
-			vframe_qos->min_qp);
-#endif
-
-	vframe_qos->max_skip = pic->max_skip;
-	vframe_qos->avg_skip = pic->avg_skip;
-	vframe_qos->min_skip = pic->min_skip;
-#ifdef SHOW_QOS_INFO
-	avs2_print(dec, 0, "skip: max:%d,	avg:%d, min:%d\n",
-			vframe_qos->max_skip,
-			vframe_qos->avg_skip,
-			vframe_qos->min_skip);
-#endif
-
-	vframe_qos->num++;
-
-}
-
 static void set_vframe(struct AVS2Decoder_s *dec,
 	struct vframe_s *vf, struct avs2_frame_s *pic, u8 dummy)
 {
 	unsigned long flags;
 	int stream_offset;
-	unsigned int frame_size = 0;
 	int pts_discontinue;
-	struct vdec_s *vdec = hw_to_vdec(dec);
 	stream_offset = pic->stream_offset;
 	avs2_print(dec, AVS2_DBG_BUFMGR,
 		"%s index = %d pos = %d\r\n",
@@ -4348,25 +4265,21 @@ static void set_vframe(struct AVS2Decoder_s *dec,
 
 	if (!dummy) {
 #ifdef MULTI_INSTANCE_SUPPORT
-		if (vdec_frame_based(vdec)) {
+		if (vdec_frame_based(hw_to_vdec(dec))) {
 			vf->pts = pic->pts;
 			vf->pts_us64 = pic->pts64;
-		} else {
+		} else
 #endif
-			if ((vdec->vbuf.no_parser == 0) || (vdec->vbuf.use_ptsserv)) {
-				/* if (pts_lookup_offset(PTS_TYPE_VIDEO,
-			   stream_offset, &vf->pts, 0) != 0) { */
-				if (pts_lookup_offset_us64
-					(PTS_TYPE_VIDEO, stream_offset,
-					&vf->pts, &frame_size, 0,
-					 &vf->pts_us64) != 0) {
+		/* if (pts_lookup_offset(PTS_TYPE_VIDEO,
+		   stream_offset, &vf->pts, 0) != 0) { */
+		if (pts_lookup_offset_us64
+			(PTS_TYPE_VIDEO, stream_offset, &vf->pts, 0,
+			 &vf->pts_us64) != 0) {
 #ifdef DEBUG_PTS
-					dec->pts_missed++;
+			dec->pts_missed++;
 #endif
-					vf->pts = 0;
-					vf->pts_us64 = 0;
-				}
-			}
+			vf->pts = 0;
+			vf->pts_us64 = 0;
 		}
 #ifdef DEBUG_PTS
 		else
@@ -4374,8 +4287,6 @@ static void set_vframe(struct AVS2Decoder_s *dec,
 #endif
 		if (pts_unstable)
 			dec->pts_mode = PTS_NONE_REF_USE_DURATION;
-
-		fill_frame_info(dec, pic, frame_size, vf->pts);
 
 		if ((dec->pts_mode == PTS_NORMAL) && (vf->pts != 0)
 			&& dec->get_frame_dur) {
@@ -4555,33 +4466,13 @@ static void set_vframe(struct AVS2Decoder_s *dec,
 			dec->bmmu_box,
 			VF_BUFFER_IDX(pic->index));
 #endif
-	if (!vdec->vbuf.use_ptsserv && vdec_stream_based(vdec)) {
-		vf->pts_us64 = stream_offset;
-		vf->pts = 0;
-	}
+
 	if (!dummy) {
 		lock_buffer(dec, flags);
 		pic->vf_ref = 1;
 		unlock_buffer(dec, flags);
 	}
 	dec->vf_pre_count++;
-}
-
-static inline void dec_update_gvs(struct AVS2Decoder_s *dec)
-{
-	if (dec->gvs->frame_height != dec->frame_height) {
-		dec->gvs->frame_width = dec->frame_width;
-		dec->gvs->frame_height = dec->frame_height;
-	}
-	if (dec->gvs->frame_dur != dec->frame_dur) {
-		dec->gvs->frame_dur = dec->frame_dur;
-		if (dec->frame_dur != 0)
-			dec->gvs->frame_rate = ((96000 * 10 / dec->frame_dur) % 10) < 5 ?
-					96000 / dec->frame_dur : (96000 / dec->frame_dur +1);
-		else
-			dec->gvs->frame_rate = -1;
-	}
-	dec->gvs->status = dec->stat | dec->fatal_error;
 }
 
 
@@ -4591,7 +4482,6 @@ static int avs2_prepare_display_buf(struct AVS2Decoder_s *dec)
 	struct vframe_s *vf = NULL;
 	/*unsigned short slice_type;*/
 	struct avs2_frame_s *pic;
-	struct vdec_s *pvdec = hw_to_vdec(dec);
 	while (1) {
 		pic = get_disp_pic(dec);
 		if (pic == NULL)
@@ -4604,7 +4494,8 @@ static int avs2_prepare_display_buf(struct AVS2Decoder_s *dec)
 
 		if (pic->error_mark) {
 			avs2_print(dec, AVS2_DBG_BUFMGR_DETAIL,
-				"!!!error pic, skip\n");
+				"!!!error pic, skip\n",
+				0);
 			continue;
 		}
 
@@ -4613,7 +4504,7 @@ static int avs2_prepare_display_buf(struct AVS2Decoder_s *dec)
 				pic->slice_type != I_IMG) {
 				avs2_print(dec, AVS2_DBG_BUFMGR_DETAIL,
 					"!!!slice type %d (not I) skip\n",
-					pic->slice_type);
+					0, pic->slice_type);
 				continue;
 			}
 			dec->skip_PB_before_I = 0;
@@ -4625,37 +4516,19 @@ static int avs2_prepare_display_buf(struct AVS2Decoder_s *dec)
 		}
 
 		if (vf) {
-			struct vdec_info tmp4x;
-			int stream_offset = pic->stream_offset;
 			set_vframe(dec, vf, pic, 0);
-			decoder_do_frame_check(pvdec, vf);
-			vdec_vframe_ready(pvdec, vf);
+			decoder_do_frame_check(hw_to_vdec(dec), vf);
 			kfifo_put(&dec->display_q, (const struct vframe_s *)vf);
 			ATRACE_COUNTER(MODULE_NAME, vf->pts);
 
-			dec_update_gvs(dec);
+	#ifndef CONFIG_AMLOGIC_MEDIA_MULTI_DEC
 			/*count info*/
-			vdec_count_info(dec->gvs, 0, stream_offset);
-		if (stream_offset) {
-			if (pic->slice_type == I_IMG) {
-				dec->gvs->i_decoded_frames++;
-			} else if (pic->slice_type == P_IMG) {
-				dec->gvs->p_decoded_frames++;
-			} else if (pic->slice_type == B_IMG) {
-				dec->gvs->b_decoded_frames++;
-			}
-		}
-			memcpy(&tmp4x, dec->gvs, sizeof(struct vdec_info));
-			tmp4x.bit_depth_luma = bit_depth_luma;
-			tmp4x.bit_depth_chroma = bit_depth_chroma;
-			tmp4x.double_write_mode = get_double_write_mode(dec);
-			vdec_fill_vdec_frame(pvdec, &dec->vframe_qos, &tmp4x, vf, pic->hw_decode_time);
-			pvdec->vdec_fps_detec(pvdec->id);
-			if (without_display_mode == 0) {
-				vf_notify_receiver(dec->provider_name,
-				VFRAME_EVENT_PROVIDER_VFRAME_READY, NULL);
-			} else
-				vavs2_vf_put(vavs2_vf_get(dec), dec);
+			gvs->frame_dur = dec->frame_dur;
+			vdec_count_info(gvs, 0, stream_offset);
+	#endif
+			hw_to_vdec(dec)->vdec_fps_detec(hw_to_vdec(dec)->id);
+			vf_notify_receiver(dec->provider_name,
+			VFRAME_EVENT_PROVIDER_VFRAME_READY, NULL);
 		}
 	}
 /*!NO_DISPLAY*/
@@ -4698,14 +4571,12 @@ static void debug_buffer_mgr_more(struct AVS2Decoder_s *dec)
 static void avs2_recycle_mmu_buf_tail(struct AVS2Decoder_s *dec)
 {
 	if (dec->cur_fb_idx_mmu != INVALID_IDX) {
-		if (dec->used_4k_num == -1) {
+		if (dec->used_4k_num == -1)
 			dec->used_4k_num =
 			(READ_VREG(HEVC_SAO_MMU_STATUS) >> 16);
-			if (dec->m_ins_flag)
-				hevc_mmu_dma_check(hw_to_vdec(dec));
-			decoder_mmu_box_free_idx_tail(dec->mmu_box,
+		decoder_mmu_box_free_idx_tail(dec->mmu_box,
 			dec->cur_fb_idx_mmu, dec->used_4k_num);
-		}
+
 		dec->cur_fb_idx_mmu = INVALID_IDX;
 		dec->used_4k_num = -1;
 	}
@@ -4828,446 +4699,6 @@ static int get_frame_rate(union param_u *params, struct AVS2Decoder_s *dec)
 	/*avs2_print(dec, 0, "avs2 frame_dur:%d,progressive:%d\n", dec->frame_dur, params->p.progressive_sequence);*/
 	return 0;
 }
-
-
-#define HEVC_MV_INFO   0x310d
-#define HEVC_QP_INFO   0x3137
-#define HEVC_SKIP_INFO 0x3136
-
-/* only when we decoded one field or one frame,
-we can call this function to get qos info*/
-static void get_picture_qos_info(struct AVS2Decoder_s *dec)
-{
-	struct avs2_frame_s *picture = dec->avs2_dec.hc.cur_pic;
-	struct vdec_s *vdec = hw_to_vdec(dec);
-	if (!picture) {
-		avs2_print(dec, AVS2_DBG_BUFMGR_MORE,
-			"decode picture is none exist\n");
-
-		return;
-	}
-	if (vdec->mvfrm) {
-		picture->frame_size = vdec->mvfrm->frame_size;
-		picture->hw_decode_time =
-		local_clock() - vdec->mvfrm->hw_decode_start;
-	}
-
-/*
-#define DEBUG_QOS
-*/
-
-	if (get_cpu_major_id() < AM_MESON_CPU_MAJOR_ID_G12A) {
-		unsigned char a[3];
-		unsigned char i, j, t;
-		unsigned long  data;
-
-		data = READ_VREG(HEVC_MV_INFO);
-		if (picture->slice_type == I_IMG)
-			data = 0;
-		a[0] = data & 0xff;
-		a[1] = (data >> 8) & 0xff;
-		a[2] = (data >> 16) & 0xff;
-
-		for (i = 0; i < 3; i++)
-			for (j = i+1; j < 3; j++) {
-				if (a[j] < a[i]) {
-					t = a[j];
-					a[j] = a[i];
-					a[i] = t;
-				} else if (a[j] == a[i]) {
-					a[i]++;
-					t = a[j];
-					a[j] = a[i];
-					a[i] = t;
-				}
-			}
-		picture->max_mv = a[2];
-		picture->avg_mv = a[1];
-		picture->min_mv = a[0];
-#ifdef DEBUG_QOS
-		avs2_print(dec, 0, "mv data %x  a[0]= %x a[1]= %x a[2]= %x\n",
-			data, a[0], a[1], a[2]);
-#endif
-
-		data = READ_VREG(HEVC_QP_INFO);
-		a[0] = data & 0x1f;
-		a[1] = (data >> 8) & 0x3f;
-		a[2] = (data >> 16) & 0x7f;
-
-		for (i = 0; i < 3; i++)
-			for (j = i+1; j < 3; j++) {
-				if (a[j] < a[i]) {
-					t = a[j];
-					a[j] = a[i];
-					a[i] = t;
-				} else if (a[j] == a[i]) {
-					a[i]++;
-					t = a[j];
-					a[j] = a[i];
-					a[i] = t;
-				}
-			}
-		picture->max_qp = a[2];
-		picture->avg_qp = a[1];
-		picture->min_qp = a[0];
-#ifdef DEBUG_QOS
-		avs2_print(dec, 0, "qp data %x  a[0]= %x a[1]= %x a[2]= %x\n",
-			data, a[0], a[1], a[2]);
-#endif
-
-		data = READ_VREG(HEVC_SKIP_INFO);
-		a[0] = data & 0x1f;
-		a[1] = (data >> 8) & 0x3f;
-		a[2] = (data >> 16) & 0x7f;
-
-		for (i = 0; i < 3; i++)
-			for (j = i+1; j < 3; j++) {
-				if (a[j] < a[i]) {
-					t = a[j];
-					a[j] = a[i];
-					a[i] = t;
-				} else if (a[j] == a[i]) {
-					a[i]++;
-					t = a[j];
-					a[j] = a[i];
-					a[i] = t;
-				}
-			}
-		picture->max_skip = a[2];
-		picture->avg_skip = a[1];
-		picture->min_skip = a[0];
-
-#ifdef DEBUG_QOS
-		avs2_print(dec, 0,
-			"skip data %x  a[0]= %x a[1]= %x a[2]= %x\n",
-			data, a[0], a[1], a[2]);
-#endif
-	} else {
-		uint32_t blk88_y_count;
-		uint32_t blk88_c_count;
-		uint32_t blk22_mv_count;
-		uint32_t rdata32;
-		int32_t mv_hi;
-		int32_t mv_lo;
-		uint32_t rdata32_l;
-		uint32_t mvx_L0_hi;
-		uint32_t mvy_L0_hi;
-		uint32_t mvx_L1_hi;
-		uint32_t mvy_L1_hi;
-		int64_t value;
-		uint64_t temp_value;
-#ifdef DEBUG_QOS
-		int pic_number = 0;
-#endif
-
-		picture->max_mv = 0;
-		picture->avg_mv = 0;
-		picture->min_mv = 0;
-
-		picture->max_skip = 0;
-		picture->avg_skip = 0;
-		picture->min_skip = 0;
-
-		picture->max_qp = 0;
-		picture->avg_qp = 0;
-		picture->min_qp = 0;
-
-
-
-#ifdef DEBUG_QOS
-		avs2_print(dec, 0, "slice_type:%d, poc:%d\n",
-			picture->slice_type,
-			pic_number);
-#endif
-		/* set rd_idx to 0 */
-	    WRITE_VREG(HEVC_PIC_QUALITY_CTRL, 0);
-
-	    blk88_y_count = READ_VREG(HEVC_PIC_QUALITY_DATA);
-	    if (blk88_y_count == 0) {
-#ifdef DEBUG_QOS
-			avs2_print(dec, 0,
-				"[Picture %d Quality] NO Data yet.\n",
-				pic_number);
-#endif
-			/* reset all counts */
-			WRITE_VREG(HEVC_PIC_QUALITY_CTRL, (1<<8));
-			return;
-	    }
-		/* qp_y_sum */
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_DATA);
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0,
-			"[Picture %d Quality] Y QP AVG : %d (%d/%d)\n",
-			pic_number, rdata32/blk88_y_count,
-			rdata32, blk88_y_count);
-#endif
-		picture->avg_qp = rdata32/blk88_y_count;
-		/* intra_y_count */
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_DATA);
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0,
-			"[Picture %d Quality] Y intra rate : %d%c (%d)\n",
-			pic_number, rdata32*100/blk88_y_count,
-			'%', rdata32);
-#endif
-		/* skipped_y_count */
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_DATA);
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0,
-			"[Picture %d Quality] Y skipped rate : %d%c (%d)\n",
-			pic_number, rdata32*100/blk88_y_count,
-			'%', rdata32);
-#endif
-		picture->avg_skip = rdata32*100/blk88_y_count;
-		/* coeff_non_zero_y_count */
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_DATA);
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0,
-			"[Picture %d Quality] Y ZERO_Coeff rate : %d%c (%d)\n",
-			pic_number, (100 - rdata32*100/(blk88_y_count*1)),
-			'%', rdata32);
-#endif
-		/* blk66_c_count */
-	    blk88_c_count = READ_VREG(HEVC_PIC_QUALITY_DATA);
-	    if (blk88_c_count == 0) {
-#ifdef DEBUG_QOS
-			avs2_print(dec, 0,
-				"[Picture %d Quality] NO Data yet.\n",
-				pic_number);
-#endif
-			/* reset all counts */
-			WRITE_VREG(HEVC_PIC_QUALITY_CTRL, (1<<8));
-			return;
-	    }
-		/* qp_c_sum */
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_DATA);
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0,
-			"[Picture %d Quality] C QP AVG : %d (%d/%d)\n",
-			pic_number, rdata32/blk88_c_count,
-			rdata32, blk88_c_count);
-#endif
-		/* intra_c_count */
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_DATA);
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0,
-			"[Picture %d Quality] C intra rate : %d%c (%d)\n",
-			pic_number, rdata32*100/blk88_c_count,
-			'%', rdata32);
-#endif
-		/* skipped_cu_c_count */
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_DATA);
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0,
-			"[Picture %d Quality] C skipped rate : %d%c (%d)\n",
-			pic_number, rdata32*100/blk88_c_count,
-			'%', rdata32);
-#endif
-		/* coeff_non_zero_c_count */
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_DATA);
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0,
-			"[Picture %d Quality] C ZERO_Coeff rate : %d%c (%d)\n",
-			pic_number, (100 - rdata32*100/(blk88_c_count*1)),
-			'%', rdata32);
-#endif
-
-		/* 1'h0, qp_c_max[6:0], 1'h0, qp_c_min[6:0],
-		1'h0, qp_y_max[6:0], 1'h0, qp_y_min[6:0] */
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_DATA);
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0, "[Picture %d Quality] Y QP min : %d\n",
-			pic_number, (rdata32>>0)&0xff);
-#endif
-		picture->min_qp = (rdata32>>0)&0xff;
-
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0, "[Picture %d Quality] Y QP max : %d\n",
-			pic_number, (rdata32>>8)&0xff);
-#endif
-		picture->max_qp = (rdata32>>8)&0xff;
-
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0, "[Picture %d Quality] C QP min : %d\n",
-			pic_number, (rdata32>>16)&0xff);
-	    avs2_print(dec, 0, "[Picture %d Quality] C QP max : %d\n",
-			pic_number, (rdata32>>24)&0xff);
-#endif
-
-		/* blk22_mv_count */
-	    blk22_mv_count = READ_VREG(HEVC_PIC_QUALITY_DATA);
-	    if (blk22_mv_count == 0) {
-#ifdef DEBUG_QOS
-			avs2_print(dec, 0,
-				"[Picture %d Quality] NO MV Data yet.\n",
-				pic_number);
-#endif
-			/* reset all counts */
-			WRITE_VREG(HEVC_PIC_QUALITY_CTRL, (1<<8));
-			return;
-	    }
-		/* mvy_L1_count[39:32], mvx_L1_count[39:32],
-		mvy_L0_count[39:32], mvx_L0_count[39:32] */
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_DATA);
-	    /* should all be 0x00 or 0xff */
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0,
-			"[Picture %d Quality] MV AVG High Bits: 0x%X\n",
-			pic_number, rdata32);
-#endif
-	    mvx_L0_hi = ((rdata32>>0)&0xff);
-	    mvy_L0_hi = ((rdata32>>8)&0xff);
-	    mvx_L1_hi = ((rdata32>>16)&0xff);
-	    mvy_L1_hi = ((rdata32>>24)&0xff);
-
-		/* mvx_L0_count[31:0] */
-	    rdata32_l = READ_VREG(HEVC_PIC_QUALITY_DATA);
-		temp_value = mvx_L0_hi;
-		temp_value = (temp_value << 32) | rdata32_l;
-
-		if (mvx_L0_hi & 0x80)
-			value = 0xFFFFFFF000000000 | temp_value;
-		else
-			value = temp_value;
-		 value = div_s64(value, blk22_mv_count);
-#ifdef DEBUG_QOS
-		avs2_print(dec, 0,
-			"[Picture %d Quality] MVX_L0 AVG : %d (%lld/%d)\n",
-			pic_number, (int)value,
-			value, blk22_mv_count);
-#endif
-		picture->avg_mv = value;
-
-		/* mvy_L0_count[31:0] */
-	    rdata32_l = READ_VREG(HEVC_PIC_QUALITY_DATA);
-		temp_value = mvy_L0_hi;
-		temp_value = (temp_value << 32) | rdata32_l;
-
-		if (mvy_L0_hi & 0x80)
-			value = 0xFFFFFFF000000000 | temp_value;
-		else
-			value = temp_value;
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0,
-			"[Picture %d Quality] MVY_L0 AVG : %d (%lld/%d)\n",
-			pic_number, rdata32_l/blk22_mv_count,
-			value, blk22_mv_count);
-#endif
-
-		/* mvx_L1_count[31:0] */
-	    rdata32_l = READ_VREG(HEVC_PIC_QUALITY_DATA);
-		temp_value = mvx_L1_hi;
-		temp_value = (temp_value << 32) | rdata32_l;
-		if (mvx_L1_hi & 0x80)
-			value = 0xFFFFFFF000000000 | temp_value;
-		else
-			value = temp_value;
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0,
-			"[Picture %d Quality] MVX_L1 AVG : %d (%lld/%d)\n",
-			pic_number, rdata32_l/blk22_mv_count,
-			value, blk22_mv_count);
-#endif
-
-		/* mvy_L1_count[31:0] */
-	    rdata32_l = READ_VREG(HEVC_PIC_QUALITY_DATA);
-		temp_value = mvy_L1_hi;
-		temp_value = (temp_value << 32) | rdata32_l;
-		if (mvy_L1_hi & 0x80)
-			value = 0xFFFFFFF000000000 | temp_value;
-		else
-			value = temp_value;
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0,
-			"[Picture %d Quality] MVY_L1 AVG : %d (%lld/%d)\n",
-			pic_number, rdata32_l/blk22_mv_count,
-			value, blk22_mv_count);
-#endif
-
-		/* {mvx_L0_max, mvx_L0_min} // format : {sign, abs[14:0]}  */
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_DATA);
-	    mv_hi = (rdata32>>16)&0xffff;
-	    if (mv_hi & 0x8000)
-			mv_hi = 0x8000 - mv_hi;
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0, "[Picture %d Quality] MVX_L0 MAX : %d\n",
-			pic_number, mv_hi);
-#endif
-		picture->max_mv = mv_hi;
-
-	    mv_lo = (rdata32>>0)&0xffff;
-	    if (mv_lo & 0x8000)
-			mv_lo = 0x8000 - mv_lo;
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0, "[Picture %d Quality] MVX_L0 MIN : %d\n",
-			pic_number, mv_lo);
-#endif
-		picture->min_mv = mv_lo;
-
-#ifdef DEBUG_QOS
-		/* {mvy_L0_max, mvy_L0_min} */
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_DATA);
-	    mv_hi = (rdata32>>16)&0xffff;
-	    if (mv_hi & 0x8000)
-			mv_hi = 0x8000 - mv_hi;
-	    avs2_print(dec, 0, "[Picture %d Quality] MVY_L0 MAX : %d\n",
-			pic_number, mv_hi);
-
-
-	    mv_lo = (rdata32>>0)&0xffff;
-	    if (mv_lo & 0x8000)
-			mv_lo = 0x8000 - mv_lo;
-
-	    avs2_print(dec, 0, "[Picture %d Quality] MVY_L0 MIN : %d\n",
-			pic_number, mv_lo);
-
-
-		/* {mvx_L1_max, mvx_L1_min} */
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_DATA);
-	    mv_hi = (rdata32>>16)&0xffff;
-	    if (mv_hi & 0x8000)
-			mv_hi = 0x8000 - mv_hi;
-
-	    avs2_print(dec, 0, "[Picture %d Quality] MVX_L1 MAX : %d\n",
-			pic_number, mv_hi);
-
-
-	    mv_lo = (rdata32>>0)&0xffff;
-	    if (mv_lo & 0x8000)
-			mv_lo = 0x8000 - mv_lo;
-
-	    avs2_print(dec, 0, "[Picture %d Quality] MVX_L1 MIN : %d\n",
-			pic_number, mv_lo);
-
-
-		/* {mvy_L1_max, mvy_L1_min} */
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_DATA);
-	    mv_hi = (rdata32>>16)&0xffff;
-	    if (mv_hi & 0x8000)
-			mv_hi = 0x8000 - mv_hi;
-
-	    avs2_print(dec, 0, "[Picture %d Quality] MVY_L1 MAX : %d\n",
-			pic_number, mv_hi);
-
-	    mv_lo = (rdata32>>0)&0xffff;
-	    if (mv_lo & 0x8000)
-			mv_lo = 0x8000 - mv_lo;
-
-	    avs2_print(dec, 0, "[Picture %d Quality] MVY_L1 MIN : %d\n",
-			pic_number, mv_lo);
-#endif
-
-	    rdata32 = READ_VREG(HEVC_PIC_QUALITY_CTRL);
-#ifdef DEBUG_QOS
-	    avs2_print(dec, 0,
-			"[Picture %d Quality] After Read : VDEC_PIC_QUALITY_CTRL : 0x%x\n",
-			pic_number, rdata32);
-#endif
-		/* reset all counts */
-	    WRITE_VREG(HEVC_PIC_QUALITY_CTRL, (1<<8));
-	}
-}
-
 static irqreturn_t vavs2_isr_thread_fn(int irq, void *data)
 {
 	struct AVS2Decoder_s *dec = (struct AVS2Decoder_s *)data;
@@ -5310,7 +4741,6 @@ static irqreturn_t vavs2_isr_thread_fn(int irq, void *data)
 		dec->start_decoding_flag |= 0x3;
 		if (dec->m_ins_flag) {
 			update_decoded_pic(dec);
-			get_picture_qos_info(dec);
 			reset_process_time(dec);
 			dec->dec_result = DEC_RESULT_DONE;
 			amhevc_stop();
@@ -5488,6 +4918,12 @@ static irqreturn_t vavs2_isr_thread_fn(int irq, void *data)
 			get_rpm_param(
 				&dec->avs2_dec.param);
 		} else {
+			PRINT_LINE();
+			dma_sync_single_for_cpu(
+				amports_get_dma_device(),
+				dec->rpm_phy_addr,
+				RPM_BUF_SIZE,
+				DMA_FROM_DEVICE);
 
 			for (i = 0; i < (RPM_END - RPM_BEGIN); i += 4) {
 				int ii;
@@ -5511,7 +4947,6 @@ static irqreturn_t vavs2_isr_thread_fn(int irq, void *data)
 		debug_buffer_mgr_more(dec);
 		get_frame_rate(&dec->avs2_dec.param, dec);
 
-#if 0 // The video_signal_type is type of uint16_t and result false, so comment it out.
 		if (dec->avs2_dec.param.p.video_signal_type
 				& (1<<30)) {
 			union param_u *pPara;
@@ -5584,7 +5019,6 @@ static irqreturn_t vavs2_isr_thread_fn(int irq, void *data)
 				"max_pic_average:0x%x\n",
 				dec->vf_dp.content_light_level.max_pic_average);
 		}
-#endif
 
 
 		if (dec->video_ori_signal_type !=
@@ -6070,6 +5504,12 @@ static void vavs2_put_timer_func(unsigned long arg)
 	}
 	if (debug & AVS2_DBG_DUMP_RPM_BUF) {
 		int i;
+		dma_sync_single_for_cpu(
+			amports_get_dma_device(),
+			dec->rpm_phy_addr,
+			RPM_BUF_SIZE,
+			DMA_FROM_DEVICE);
+
 		pr_info("RPM:\n");
 		for (i = 0; i < RPM_BUF_SIZE; i += 4) {
 			int ii;
@@ -6086,6 +5526,12 @@ static void vavs2_put_timer_func(unsigned long arg)
 	}
 	if (debug & AVS2_DBG_DUMP_LMEM_BUF) {
 		int i;
+		dma_sync_single_for_cpu(
+			amports_get_dma_device(),
+			dec->lmem_phy_addr,
+			LMEM_BUF_SIZE,
+			DMA_FROM_DEVICE);
+
 		pr_info("LMEM:\n");
 		for (i = 0; i < LMEM_BUF_SIZE; i += 4) {
 			int ii;
@@ -6178,33 +5624,25 @@ int vavs2_dec_status(struct vdec_s *vdec, struct vdec_info *vstatus)
 	vstatus->frame_height = dec->frame_height;
 
 	if (dec->frame_dur != 0)
-		vstatus->frame_rate = ((96000 * 10 / dec->frame_dur) % 10) < 5 ?
-		                    96000 / dec->frame_dur : (96000 / dec->frame_dur +1);
+		vstatus->frame_rate = 96000 / dec->frame_dur;
 	else
 		vstatus->frame_rate = -1;
 	vstatus->error_count = 0;
 	vstatus->status = dec->stat | dec->fatal_error;
 	vstatus->frame_dur = dec->frame_dur;
-	vstatus->bit_rate = dec->gvs->bit_rate;
-	vstatus->frame_data = dec->gvs->frame_data;
-	vstatus->total_data = dec->gvs->total_data;
-	vstatus->frame_count = dec->gvs->frame_count;
-	vstatus->error_frame_count = dec->gvs->error_frame_count;
-	vstatus->drop_frame_count = dec->gvs->drop_frame_count;
-	vstatus->i_decoded_frames = dec->gvs->i_decoded_frames;
-	vstatus->i_lost_frames =  dec->gvs->i_lost_frames;
-	vstatus->i_concealed_frames =  dec->gvs->i_concealed_frames;
-	vstatus->p_decoded_frames =  dec->gvs->p_decoded_frames;
-	vstatus->p_lost_frames =  dec->gvs->p_lost_frames;
-	vstatus->p_concealed_frames =  dec->gvs->p_concealed_frames;
-	vstatus->b_decoded_frames =  dec->gvs->b_decoded_frames;
-	vstatus->b_lost_frames =  dec->gvs->b_lost_frames;
-	vstatus->b_concealed_frames =  dec->gvs->b_concealed_frames;
-	vstatus->total_data = dec->gvs->total_data;
-	vstatus->samp_cnt = dec->gvs->samp_cnt;
-	vstatus->offset = dec->gvs->offset;
+#ifndef CONFIG_AMLOGIC_MEDIA_MULTI_DEC
+	vstatus->bit_rate = gvs->bit_rate;
+	vstatus->frame_data = gvs->frame_data;
+	vstatus->total_data = gvs->total_data;
+	vstatus->frame_count = gvs->frame_count;
+	vstatus->error_frame_count = gvs->error_frame_count;
+	vstatus->drop_frame_count = gvs->drop_frame_count;
+	vstatus->total_data = gvs->total_data;
+	vstatus->samp_cnt = gvs->samp_cnt;
+	vstatus->offset = gvs->offset;
 	snprintf(vstatus->vdec_name, sizeof(vstatus->vdec_name),
 		"%s", DRIVER_NAME);
+#endif
 	return 0;
 }
 
@@ -6290,7 +5728,7 @@ static int vavs2_set_trickmode(struct vdec_s *vdec, unsigned long trickmode)
 		(struct AVS2Decoder_s *)vdec->private;
 	if (i_only_flag & 0x100)
 		return 0;
-	if (trickmode == TRICKMODE_I || trickmode == TRICKMODE_I_HEVC)
+	if (trickmode == TRICKMODE_I)
 		dec->i_only = 0x3;
 	else if (trickmode == TRICKMODE_NONE)
 		dec->i_only = 0x0;
@@ -6373,8 +5811,6 @@ static s32 vavs2_init(struct vdec_s *vdec)
 	if (vavs2_local_init(dec) < 0)
 		return -EBUSY;
 
-	vdec_set_vframe_comm(vdec, DRIVER_NAME);
-
 	fw = vmalloc(sizeof(struct firmware_s) + fw_size);
 	if (IS_ERR_OR_NULL(fw))
 		return -ENOMEM;
@@ -6403,7 +5839,9 @@ static s32 vavs2_init(struct vdec_s *vdec)
 
 		return 0;
 	}
+
 	amhevc_enable();
+
 	ret = amhevc_loadmc_ex(VFORMAT_AVS2, NULL, fw->data);
 	if (ret < 0) {
 		amhevc_disable();
@@ -6680,32 +6118,16 @@ static int amvdec_avs2_remove(struct platform_device *pdev)
 }
 
 /****************************************/
-#ifdef CONFIG_PM
-static int avs2_suspend(struct device *dev)
-{
-	amhevc_suspend(to_platform_device(dev), dev->power.power_state);
-	return 0;
-}
-
-static int avs2_resume(struct device *dev)
-{
-	amhevc_resume(to_platform_device(dev));
-	return 0;
-}
-
-static const struct dev_pm_ops avs2_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(avs2_suspend, avs2_resume)
-};
-#endif
 
 static struct platform_driver amvdec_avs2_driver = {
 	.probe = amvdec_avs2_probe,
 	.remove = amvdec_avs2_remove,
+#ifdef CONFIG_PM
+	.suspend = amhevc_suspend,
+	.resume = amhevc_resume,
+#endif
 	.driver = {
 		.name = DRIVER_NAME,
-#ifdef CONFIG_PM
-		.pm = &avs2_pm_ops,
-#endif
 	}
 };
 
@@ -6713,8 +6135,6 @@ static struct codec_profile_t amvdec_avs2_profile = {
 	.name = "avs2",
 	.profile = ""
 };
-
-static struct codec_profile_t amvdec_avs2_profile_mult;
 
 static unsigned char get_data_check_sum
 	(struct AVS2Decoder_s *dec, int size)
@@ -6900,15 +6320,13 @@ static void avs2_work(struct work_struct *work)
 			return;
 		}
 	} else if (dec->dec_result == DEC_RESULT_EOS) {
-		avs2_print(dec, 0,
+		avs2_print(dec, PRINT_FLAG_VDEC_STATUS,
 			"%s: end of stream\n",
 			__func__);
 		dec->eos = 1;
-		if ( dec->avs2_dec.hc.cur_pic != NULL) {
-			check_pic_error(dec, dec->avs2_dec.hc.cur_pic);
-			avs2_post_process(&dec->avs2_dec);
-			avs2_prepare_display_buf(dec);
-		}
+		check_pic_error(dec, dec->avs2_dec.hc.cur_pic);
+		avs2_post_process(&dec->avs2_dec);
+		avs2_prepare_display_buf(dec);
 		vdec_vframe_dirty(hw_to_vdec(dec), dec->chunk);
 	} else if (dec->dec_result == DEC_RESULT_FORCE_EXIT) {
 		avs2_print(dec, PRINT_FLAG_VDEC_STATUS,
@@ -6973,7 +6391,7 @@ static unsigned long run_ready(struct vdec_s *vdec, unsigned long mask)
 	if (dec->next_again_flag &&
 		(!vdec_frame_based(vdec))) {
 		u32 parser_wr_ptr =
-			STBUF_READ(&vdec->vbuf, get_wp);
+			READ_PARSER_REG(PARSER_VIDEO_WP);
 		if (parser_wr_ptr >= dec->pre_parser_wr_ptr &&
 			(parser_wr_ptr - dec->pre_parser_wr_ptr) <
 			again_threshold) {
@@ -6988,8 +6406,8 @@ static unsigned long run_ready(struct vdec_s *vdec, unsigned long mask)
 		&& pre_decode_buf_level != 0) {
 		u32 rp, wp, level;
 
-		rp = STBUF_READ(&vdec->vbuf, get_rp);
-		wp = STBUF_READ(&vdec->vbuf, get_wp);
+		rp = READ_PARSER_REG(PARSER_VIDEO_RP);
+		wp = READ_PARSER_REG(PARSER_VIDEO_WP);
 		if (wp < rp)
 			level = vdec->input.size + wp - rp;
 		else
@@ -7049,12 +6467,9 @@ static void run(struct vdec_s *vdec, unsigned long mask,
 	dec->vdec_cb = callback;
 	/* dec->chunk = vdec_prepare_input(vdec); */
 	hevc_reset_core(vdec);
-
-	if (vdec_stream_based(vdec)) {
-		dec->pre_parser_wr_ptr =
-			STBUF_READ(&vdec->vbuf, get_wp);
+	dec->pre_parser_wr_ptr =
+			READ_PARSER_REG(PARSER_VIDEO_WP);
 		dec->next_again_flag = 0;
-	}
 
 	r = vdec_prepare_input(vdec, &dec->chunk);
 	if (r < 0) {
@@ -7143,8 +6558,6 @@ static void run(struct vdec_s *vdec, unsigned long mask,
 		WRITE_VREG(HEVC_SHIFT_BYTE_COUNT, 0);
 		r = dec->chunk->size +
 			(dec->chunk->offset & (VDEC_FIFO_ALIGN - 1));
-		if (vdec->mvfrm)
-			vdec->mvfrm->frame_size = dec->chunk->size;
 	}
 
 	WRITE_VREG(HEVC_DECODE_SIZE, r);
@@ -7162,8 +6575,6 @@ static void run(struct vdec_s *vdec, unsigned long mask,
 	mod_timer(&dec->timer, jiffies);
 	dec->stat |= STAT_TIMER_ARM;
 	dec->stat |= STAT_ISR_REG;
-	if (vdec->mvfrm)
-		vdec->mvfrm->hw_decode_start = local_clock();
 	amhevc_start();
 	dec->stat |= STAT_VDEC_RUN;
 }
@@ -7248,7 +6659,7 @@ static void avs2_dump_state(struct vdec_s *vdec)
 
 	for (i = 0; i < MAX_BUF_NUM; i++) {
 		avs2_print(dec, 0,
-			"mv_Buf(%d) start_adr 0x%lx size 0x%x used %d\n",
+			"mv_Buf(%d) start_adr 0x%x size 0x%x used %d\n",
 			i,
 			dec->m_mv_BUF[i].start_adr,
 			dec->m_mv_BUF[i].size,
@@ -7293,10 +6704,10 @@ static void avs2_dump_state(struct vdec_s *vdec)
 		READ_VREG(HEVC_STREAM_RD_PTR));
 	avs2_print(dec, 0,
 		"PARSER_VIDEO_RP=0x%x\n",
-		STBUF_READ(&vdec->vbuf, get_rp));
+		READ_PARSER_REG(PARSER_VIDEO_RP));
 	avs2_print(dec, 0,
 		"PARSER_VIDEO_WP=0x%x\n",
-		STBUF_READ(&vdec->vbuf, get_wp));
+		READ_PARSER_REG(PARSER_VIDEO_WP));
 
 	if (input_frame_based(vdec) &&
 		(debug & PRINT_FLAG_VDEC_DATA)
@@ -7382,11 +6793,10 @@ static int ammvdec_avs2_probe(struct platform_device *pdev)
 	dec->index = pdev->id;
 	dec->m_ins_flag = 1;
 
-	if (pdata->use_vfm_path) {
+	if (pdata->use_vfm_path)
 		snprintf(pdata->vf_provider_name, VDEC_PROVIDER_NAME_SIZE,
 			VFM_DEC_PROVIDER_NAME);
-		dec->frameinfo_enable = 1;
-	} else
+	else
 		snprintf(pdata->vf_provider_name, VDEC_PROVIDER_NAME_SIZE,
 			MULTI_INSTANCE_PROVIDER_NAME ".%02x", pdev->id & 0xff);
 
@@ -7403,7 +6813,7 @@ static int ammvdec_avs2_probe(struct platform_device *pdev)
 		dec->stat |= VP9_TRIGGER_FRAME_ENABLE;
 #if 1
 	if ((debug & IGNORE_PARAM_FROM_CONFIG) == 0 &&
-			pdata->config_len) {
+			pdata->config && pdata->config_len) {
 		/*use ptr config for doubel_write_mode, etc*/
 		avs2_print(dec, 0, "pdata->config=%s\n", pdata->config);
 		if (get_config_int(pdata->config, "avs2_double_write_mode",
@@ -7411,21 +6821,6 @@ static int ammvdec_avs2_probe(struct platform_device *pdev)
 			dec->double_write_mode = config_val;
 		else
 			dec->double_write_mode = double_write_mode;
-
-		if (get_config_int(pdata->config, "parm_v4l_buffer_margin",
-			&config_val) == 0)
-			dec->dynamic_buf_margin = config_val;
-		else
-			dec->dynamic_buf_margin = 0;
-
-		if (get_config_int(pdata->config, "sidebind_type",
-				&config_val) == 0)
-			dec->sidebind_type = config_val;
-
-		if (get_config_int(pdata->config, "sidebind_channel_id",
-				&config_val) == 0)
-			dec->sidebind_channel_id = config_val;
-
 		if (get_config_int(pdata->config, "HDRStaticInfo",
 				&vf_dp.present_flag) == 0
 				&& vf_dp.present_flag == 1) {
@@ -7471,7 +6866,6 @@ static int ammvdec_avs2_probe(struct platform_device *pdev)
 		dec->vavs2_amstream_dec_info.height = 0;
 		dec->vavs2_amstream_dec_info.rate = 30;*/
 		dec->double_write_mode = double_write_mode;
-		dec->dynamic_buf_margin = dynamic_buf_num_margin;
 	}
 	video_signal_type = dec->video_signal_type;
 
@@ -7502,6 +6896,13 @@ static int ammvdec_avs2_probe(struct platform_device *pdev)
 	dec->first_sc_checked = 0;
 	dec->fatal_error = 0;
 	dec->show_frame_num = 0;
+	if (pdata == NULL) {
+		pr_info("\namvdec_avs2 memory resource undefined.\n");
+		uninit_mmu_buffers(dec);
+		/* devm_kfree(&pdev->dev, (void *)dec); */
+		vfree((void *)dec);
+		return -EFAULT;
+	}
 
 	if (debug) {
 		pr_info("===AVS2 decoder mem resource 0x%lx size 0x%x\n",
@@ -7580,11 +6981,12 @@ static int ammvdec_avs2_remove(struct platform_device *pdev)
 static struct platform_driver ammvdec_avs2_driver = {
 	.probe = ammvdec_avs2_probe,
 	.remove = ammvdec_avs2_remove,
+#ifdef CONFIG_PM
+	.suspend = amvdec_suspend,
+	.resume = amvdec_resume,
+#endif
 	.driver = {
 		.name = MULTI_DRIVER_NAME,
-#ifdef CONFIG_PM
-		.pm = &avs2_pm_ops,
-#endif
 	}
 };
 #endif
@@ -7669,6 +7071,7 @@ static int __init amvdec_avs2_driver_init_module(void)
 	if (get_cpu_major_id() >= AM_MESON_CPU_MAJOR_ID_SM1) {
 		amvdec_avs2_profile.profile =
 				"8k, 10bit, dwrite, compressed";
+		vcodec_profile_register(&amvdec_avs2_profile);
 	} else if (get_cpu_major_id() >= AM_MESON_CPU_MAJOR_ID_G12A) {
 		if (vdec_is_support_4k())
 			amvdec_avs2_profile.profile =
@@ -7676,14 +7079,10 @@ static int __init amvdec_avs2_driver_init_module(void)
 		else
 			amvdec_avs2_profile.profile =
 				"10bit, dwrite, compressed";
+		vcodec_profile_register(&amvdec_avs2_profile);
 	} else {
 		amvdec_avs2_profile.name = "avs2_unsupport";
 	}
-
-	vcodec_profile_register(&amvdec_avs2_profile);
-	amvdec_avs2_profile_mult = amvdec_avs2_profile;
-	amvdec_avs2_profile_mult.name = "mavs2";
-	vcodec_profile_register(&amvdec_avs2_profile_mult);
 
 	INIT_REG_NODE_CONFIGS("media.decoder", &avs2_node,
 		"avs2", avs2_configs, CONFIG_FOR_RW);
@@ -7878,9 +7277,6 @@ MODULE_PARM_DESC(again_threshold, "\n again_threshold\n");
 module_param(force_disp_pic_index, int, 0664);
 MODULE_PARM_DESC(force_disp_pic_index,
 	"\n amvdec_h265 force_disp_pic_index\n");
-
-module_param(without_display_mode, uint, 0664);
-MODULE_PARM_DESC(without_display_mode, "\n without_display_mode\n");
 
 module_init(amvdec_avs2_driver_init_module);
 module_exit(amvdec_avs2_driver_remove_module);

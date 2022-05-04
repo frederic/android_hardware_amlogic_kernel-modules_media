@@ -43,7 +43,7 @@
 #include <linux/amlogic/media/utils/vdec_reg.h>
 #include "../utils/amvdec.h"
 #include "vh264.h"
-#include "../../../stream_input/amports/streambuf.h"
+#include "../../../stream_input/parser/streambuf.h"
 #include <linux/delay.h>
 #include <linux/amlogic/media/video_sink/video.h>
 #include <linux/amlogic/tee.h>
@@ -57,6 +57,8 @@
 #include "../../../common/chips/decoder_cpu_ver_info.h"
 #include <linux/uaccess.h>
 
+
+#include <trace/events/meson_atrace.h>
 
 
 #define DRIVER_NAME "amvdec_h264"
@@ -82,6 +84,7 @@
 #define DUR2PTS_REM(x) (x*90 - DUR2PTS(x)*96)
 #define FIX_FRAME_RATE_CHECK_IDRFRAME_NUM 2
 #define VDEC_CLOCK_ADJUST_FRAME 30
+#define DEFAULT_FRAME_DURATION 1500
 
 static inline bool close_to(int a, int b, int m)
 {
@@ -205,6 +208,7 @@ static struct buffer_spec_s fense_buffer_spec[2];
 
 #define USER_DATA_RUND_SIZE		(USER_DATA_SIZE + 4096)
 static struct vframe_s fense_vf[2];
+static bool skip_switching_task;
 
 static struct timer_list recycle_timer;
 static u32 stat;
@@ -252,14 +256,6 @@ static unsigned int canvas_mode;
 static u32 bad_block_scale;
 #endif
 static u32 enable_userdata_debug;
-
-/* if not define, must clear AV_SCRATCH_J in isr when
- * ITU_T35 code enabled in ucode, otherwise may fatal
- * error repeatly.
- */
-//#define ENABLE_SEI_ITU_T35
-
-
 
 static unsigned int enable_switch_fense = 1;
 #define EN_SWITCH_FENCE() (enable_switch_fense && !is_4k)
@@ -376,7 +372,8 @@ static bool pts_discontinue;
 static struct ge2d_context_s *ge2d_videoh264_context;
 
 static struct vdec_info *gvs;
-
+static u32 start_time;
+static bool enable_start_time;
 static struct vdec_s *vdec_h264;
 
 static int ge2d_videoh264task_init(void)
@@ -551,18 +548,6 @@ static struct vframe_s *vh264_vf_get(void *op_arg)
 
 	return NULL;
 }
-static bool vf_valid_check(struct vframe_s *vf) {
-	int i;
-	for (i = 0; i < VF_POOL_SIZE; i++) {
-		if (vf == &vfpool[i])
-			return true;
-	}
-	pr_info(" invalid vf been put, vf = %p\n", vf);
-	for (i = 0; i < VF_POOL_SIZE; i++) {
-		pr_info("www valid vf[%d]= %p \n", i, &vfpool[i]);
-	}
-	return false;
-}
 
 static void vh264_vf_put(struct vframe_s *vf, void *op_arg)
 {
@@ -570,10 +555,9 @@ static void vh264_vf_put(struct vframe_s *vf, void *op_arg)
 
 	spin_lock_irqsave(&recycle_lock, flags);
 
-	if ((vf != &fense_vf[0]) && (vf != &fense_vf[1])) {
-		if (vf && (vf_valid_check(vf) == true))
-			kfifo_put(&recycle_q, (const struct vframe_s *)vf);
-	}
+	if ((vf != &fense_vf[0]) && (vf != &fense_vf[1]))
+		kfifo_put(&recycle_q, (const struct vframe_s *)vf);
+
 	spin_unlock_irqrestore(&recycle_lock, flags);
 }
 
@@ -2291,8 +2275,13 @@ static void vh264_set_params(struct work_struct *work)
 				}
 			}
 		}
-	} else
+	} else {
 		pr_info("H.264: timing_info not present\n");
+		if (!frame_dur && !duration_from_pts_done) {
+			pr_info("H.264: default duration is used\n");
+			frame_dur = DEFAULT_FRAME_DURATION;
+		}
+	}
 
 	if (aspect_ratio_info_present_flag) {
 		if (aspect_ratio_idc == EXTEND_SAR) {
@@ -2570,36 +2559,6 @@ static inline bool vh264_isr_parser(struct vframe_s *vf,
 	}
 	return true;
 }
-
-static inline void h264_update_gvs(void)
-{
-	u32 ratio_control;
-	u32 ar;
-
-	if (gvs->frame_height != frame_height) {
-		gvs->frame_width = frame_width;
-		gvs->frame_height = frame_height;
-	}
-	if (gvs->frame_dur != frame_dur) {
-		gvs->frame_dur = frame_dur;
-		if (frame_dur != 0)
-			gvs->frame_rate = 96000 / frame_dur;
-		else
-			gvs->frame_rate = -1;
-	}
-	gvs->error_count = READ_VREG(AV_SCRATCH_D);
-	gvs->status = stat;
-	if (fatal_error_reset)
-		gvs->status |= fatal_error_flag;
-	ar = min_t(u32,
-			h264_ar,
-			DISP_RATIO_ASPECT_RATIO_MAX);
-	ratio_control =
-		ar << DISP_RATIO_ASPECT_RATIO_BIT;
-	gvs->ratio_control = ratio_control;
-}
-
-
 #ifdef HANDLE_H264_IRQ
 static irqreturn_t vh264_isr(int irq, void *dev_id)
 #else
@@ -2611,11 +2570,12 @@ static void vh264_isr(void)
 	unsigned int cpu_cmd;
 	unsigned int pts, pts_lookup_save, pts_valid_save, pts_valid = 0;
 	unsigned int pts_us64_valid = 0;
-	unsigned int  framesize;
+	unsigned int  framesize = 0;
 	u64 pts_us64;
 	bool force_interlaced_frame = false;
+#ifdef ENABLE_SEI_ITU_T35
 	unsigned int sei_itu35_flags;
-
+#endif
 	static const unsigned int idr_num =
 		FIX_FRAME_RATE_CHECK_IDRFRAME_NUM;
 	static const unsigned int flg_1080_itl =
@@ -2669,7 +2629,8 @@ static void vh264_isr(void)
 			} else {
 			vh264_stream_switching_state = SWITCHING_STATE_ON_CMD1;
 			pr_info("Enter switching mode cmd1.\n");
-			schedule_work(&stream_switching_work);
+			if (!skip_switching_task)
+				schedule_work(&stream_switching_work);
 			}
 			return IRQ_HANDLED;
 		}
@@ -2803,8 +2764,8 @@ static void vh264_isr(void)
 				pts_hit++;
 #endif
 			} else if (pts_lookup_offset_us64
-					(PTS_TYPE_VIDEO, b_offset, &pts,
-					&framesize, 0, &pts_us64) == 0) {
+					   (PTS_TYPE_VIDEO, b_offset, &pts, 0,
+						&pts_us64) == 0) {
 				pts_valid = 1;
 				pts_us64_valid = 1;
 #ifdef DEBUG_PTS
@@ -2905,7 +2866,7 @@ static void vh264_isr(void)
 			frame_count++;
 
 			s_vframe_qos.num = frame_count;
-			//vdec_fill_frame_info(&s_vframe_qos, 1);
+			vdec_fill_frame_info(&s_vframe_qos, 1);
 
 			/* on second IDR frame,check the diff between pts
 			 *  compute from duration and pts from lookup ,
@@ -3041,9 +3002,8 @@ static void vh264_isr(void)
 			 */
 
 			/*count info*/
-			h264_update_gvs();
+			gvs->frame_dur = frame_dur;
 			vdec_count_info(gvs, error, b_offset);
-			vdec_fill_vdec_frame(vdec_h264, &s_vframe_qos, gvs, vf, 0);
 
 			if ((pts_valid) && (check_pts_discontinue)
 					&& (!error)) {
@@ -3122,10 +3082,17 @@ static void vh264_isr(void)
 					kfifo_put(&recycle_q,
 						(const struct vframe_s *)vf);
 				} else {
-					p_last_vf = vf;
-					pts_discontinue = false;
-					kfifo_put(&delay_display_q,
-						  (const struct vframe_s *)vf);
+					if (enable_start_time
+						&& vf->pts < start_time) {
+						kfifo_put(&recycle_q,
+						(const struct vframe_s *)vf);
+					} else {
+						enable_start_time = false;
+						p_last_vf = vf;
+						pts_discontinue = false;
+						kfifo_put(&delay_display_q,
+						(const struct vframe_s *)vf);
+					}
 				}
 			} else {
 				if (pic_struct_present
@@ -3174,9 +3141,17 @@ static void vh264_isr(void)
 						(const struct vframe_s *)vf);
 					continue;
 				} else {
-					pts_discontinue = false;
-					kfifo_put(&delay_display_q,
+					if (enable_start_time
+						 && vf->pts < start_time) {
+						kfifo_put(&recycle_q,
 						(const struct vframe_s *)vf);
+						continue;
+					} else {
+						enable_start_time = false;
+						pts_discontinue = false;
+						kfifo_put(&delay_display_q,
+						(const struct vframe_s *)vf);
+					}
 				}
 
 				if (READ_VREG(AV_SCRATCH_F) & 2)
@@ -3234,7 +3209,8 @@ static void vh264_isr(void)
 		vh264_stream_switching_state = SWITCHING_STATE_ON_CMD3;
 
 		pr_info("Enter switching mode cmd3.\n");
-		schedule_work(&stream_switching_work);
+		if (!skip_switching_task)
+			schedule_work(&stream_switching_work);
 
 	} else if ((cpu_cmd & 0xff) == 4) {
 		vh264_running = 1;
@@ -3267,14 +3243,12 @@ static void vh264_isr(void)
 	} else if ((cpu_cmd & 0xff) == 9) {
 		first_offset = READ_VREG(AV_SCRATCH_1);
 		if (pts_lookup_offset_us64
-			(PTS_TYPE_VIDEO, first_offset, &first_pts,
-			&first_frame_size, 0,
+			(PTS_TYPE_VIDEO, first_offset, &first_pts, 0,
 			 &first_pts64) == 0)
 			first_pts_cached = true;
 		WRITE_VREG(AV_SCRATCH_0, 0);
 	} else if ((cpu_cmd & 0xff) == 0xa) {
 		int b_offset;
-		unsigned int frame_size;
 
 		b_offset = READ_VREG(AV_SCRATCH_2);
 		buffer_index = READ_VREG(AV_SCRATCH_1);
@@ -3288,8 +3262,7 @@ static void vh264_isr(void)
 			return IRQ_HANDLED;
 		}
 		if (pts_lookup_offset_us64 (PTS_TYPE_VIDEO, b_offset,
-				&pts, &frame_size,
-				0, &pts_us64) != 0)
+				&pts, 0, &pts_us64) != 0)
 			vf->pts_us64 = vf->pts = 0;
 		else {
 			vf->pts_us64 = pts_us64;
@@ -3319,17 +3292,12 @@ static void vh264_isr(void)
 	} else if ((cpu_cmd & 0xff) == 0xB) {
 		schedule_work(&qos_work);
 	}
-
+#ifdef ENABLE_SEI_ITU_T35
 	sei_itu35_flags = READ_VREG(AV_SCRATCH_J);
 	if (sei_itu35_flags & (1 << 15)) {	/* data ready */
-#ifdef ENABLE_SEI_ITU_T35
 		schedule_work(&userdata_push_work);
-#else
-		/* necessary if enabled itu_t35 in ucode*/
-		WRITE_VREG(AV_SCRATCH_J, 0);
-#endif
 	}
-
+#endif
 #ifdef HANDLE_H264_IRQ
 	return IRQ_HANDLED;
 #else
@@ -3553,6 +3521,16 @@ int vh264_set_trickmode(struct vdec_s *vdec, unsigned long trickmode)
 int vh264_set_isreset(struct vdec_s *vdec, int isreset)
 {
 	is_reset = isreset;
+	return 0;
+}
+
+int vh264_set_starttime(struct vdec_s *vdec, unsigned int starttime)
+{
+	if (starttime > 0) {
+		pr_info("set start time :%d\n", starttime);
+		start_time = starttime;
+		enable_start_time = true;
+	}
 	return 0;
 }
 
@@ -3990,6 +3968,12 @@ static s32 vh264_init(void)
 	} else
 		fr_hint_status = VDEC_NEED_HINT;
 
+	if (vf_notify_receiver(PROVIDER_NAME,
+		VFRAME_EVENT_PROVIDER_QUREY_FRAME_NOHOLDING, NULL))
+		skip_switching_task = true;
+	else
+		skip_switching_task = false;
+
 	stat |= STAT_VF_HOOK;
 
 	recycle_timer.data = (ulong) &recycle_timer;
@@ -4325,6 +4309,8 @@ static int amvdec_h264_probe(struct platform_device *pdev)
 	pdata->wakeup_userdata_poll = vh264_wakeup_userdata_poll;
 
 	is_reset = 0;
+	pdata->set_starttime = vh264_set_starttime;
+	enable_start_time = false;
 	clk_adj_frame_count = 0;
 	if (vh264_init() < 0) {
 		pr_info("\namvdec_h264 init failed.\n");
@@ -4356,7 +4342,6 @@ static int amvdec_h264_probe(struct platform_device *pdev)
 	atomic_set(&vh264_active, 1);
 
 	mutex_unlock(&vh264_mutex);
-	vdec_set_vframe_comm(pdata, DRIVER_NAME);
 
 	return 0;
 }
@@ -4395,32 +4380,16 @@ static int amvdec_h264_remove(struct platform_device *pdev)
 }
 
 /****************************************/
-#ifdef CONFIG_PM
-static int h264_suspend(struct device *dev)
-{
-	amvdec_suspend(to_platform_device(dev), dev->power.power_state);
-	return 0;
-}
-
-static int h264_resume(struct device *dev)
-{
-	amvdec_resume(to_platform_device(dev));
-	return 0;
-}
-
-static const struct dev_pm_ops h264_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(h264_suspend, h264_resume)
-};
-#endif
 
 static struct platform_driver amvdec_h264_driver = {
 	.probe = amvdec_h264_probe,
 	.remove = amvdec_h264_remove,
+#ifdef CONFIG_PM
+	.suspend = amvdec_suspend,
+	.resume = amvdec_resume,
+#endif
 	.driver = {
 		.name = DRIVER_NAME,
-#ifdef CONFIG_PM
-		.pm = &h264_pm_ops,
-#endif
 	}
 };
 

@@ -32,8 +32,8 @@
 #include <linux/amlogic/media/utils/aformat.h>
 #include <linux/amlogic/media/registers/register.h>
 #include "../stream_input/amports/adec.h"
-#include "../stream_input/amports/streambuf.h"
-#include "../stream_input/amports/streambuf_reg.h"
+#include "../stream_input/parser/streambuf.h"
+#include "../stream_input/parser/streambuf_reg.h"
 #include "../stream_input/parser/tsdemux.h"
 #include "../stream_input/parser/psparser.h"
 #include "../stream_input/parser/esparser.h"
@@ -52,11 +52,10 @@
 
 #define PTS_OUTSIDE	(1)
 #define SYNC_OUTSIDE	(2)
+#define USE_V4L_PORTS	(0x80)
 
 //#define DATA_DEBUG
 
-extern int dump_output_frame;
-extern void aml_recycle_dma_buffers(struct aml_vcodec_ctx *ctx, u32 handle);
 static int def_4k_vstreambuf_sizeM =
 	(DEFAULT_VIDEO_BUFFER_SIZE_4K >> 20);
 static int def_vstreambuf_sizeM =
@@ -114,12 +113,11 @@ extern bool aml_set_vfm_enable, aml_set_vdec_type_enable;
 
 static void set_default_params(struct aml_vdec_adapt *vdec)
 {
-	ulong sync_mode = (PTS_OUTSIDE | SYNC_OUTSIDE);
-
+	unsigned long sync_mode = (PTS_OUTSIDE | SYNC_OUTSIDE | USE_V4L_PORTS);
 	vdec->dec_prop.param = (void *)sync_mode;
 	vdec->dec_prop.format = vdec->format;
 	vdec->dec_prop.width = 1920;
-	vdec->dec_prop.height = 1088;
+	vdec->dec_prop.height = 1080;
 	vdec->dec_prop.rate = 3200;
 }
 
@@ -200,11 +198,11 @@ static void change_vbufsize(struct vdec_s *vdec,
 	struct stream_buf_s *pvbuf)
 {
 	if (pvbuf->buf_start != 0) {
-		v4l_dbg(0, V4L_DEBUG_CODEC_ERROR, "streambuf is alloced before\n");
+		pr_info("streambuf is alloced before\n");
 		return;
 	}
 
-	if (vdec->port->is_4k) {
+	if (pvbuf->for_4k) {
 		pvbuf->buf_size = def_4k_vstreambuf_sizeM * SZ_1M;
 
 		if (vdec->port_flag & PORT_FLAG_DRM)
@@ -237,6 +235,56 @@ static void user_buffer_init(void)
 	pubuf->buf_rp = 0;
 }
 
+static void audio_component_release(struct stream_port_s *port,
+	struct stream_buf_s *pbuf, int release_num)
+{
+	switch (release_num) {
+		default:
+		case 0:
+		case 4:
+			esparser_release(pbuf);
+		case 3:
+			adec_release(port->vformat);
+		case 2:
+			stbuf_release(pbuf, false);
+		case 1:
+			;
+	}
+}
+
+static int audio_component_init(struct stream_port_s *port,
+	struct stream_buf_s *pbuf)
+{
+	int r;
+
+	if ((port->flag & PORT_FLAG_AFORMAT) == 0) {
+		pr_err("aformat not set\n");
+		return 0;
+	}
+
+	r = stbuf_init(pbuf, NULL, false);
+	if (r < 0)
+		return r;
+
+	r = adec_init(port);
+	if (r < 0) {
+		audio_component_release(port, pbuf, 2);
+		return r;
+	}
+
+	if (port->type & PORT_TYPE_ES) {
+		r = esparser_init(pbuf, NULL);
+		if (r < 0) {
+			audio_component_release(port, pbuf, 3);
+			return r;
+		}
+	}
+
+	pbuf->flag |= BUF_FLAG_IN_USE;
+
+	return 0;
+}
+
 static void video_component_release(struct stream_port_s *port,
 struct stream_buf_s *pbuf, int release_num)
 {
@@ -245,13 +293,14 @@ struct stream_buf_s *pbuf, int release_num)
 	struct vdec_s *vdec = ada_ctx->vdec;
 
 	struct vdec_s *slave = NULL;
+	bool is_multidec = !vdec_single(vdec);
 
 	switch (release_num) {
 	default:
 	case 0:
 	case 4: {
 		if ((port->type & PORT_TYPE_FRAME) == 0)
-			esparser_release(pbuf);
+		esparser_release(pbuf);
 	}
 
 	case 3: {
@@ -266,7 +315,7 @@ struct stream_buf_s *pbuf, int release_num)
 
 	case 2: {
 		if ((port->type & PORT_TYPE_FRAME) == 0)
-			stbuf_release(pbuf);
+		stbuf_release(pbuf, is_multidec);
 	}
 
 	case 1:
@@ -283,23 +332,23 @@ static int video_component_init(struct stream_port_s *port,
 	struct vdec_s *vdec = ada_ctx->vdec;
 
 	if ((vdec->port_flag & PORT_FLAG_VFORMAT) == 0) {
-		v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_ERROR, "vformat not set\n");
+		pr_err("vformat not set\n");
 		return -EPERM;
 	}
 
 	if ((vdec->sys_info->height * vdec->sys_info->width) > 1920 * 1088
 		|| port->vformat == VFORMAT_H264_4K2K) {
-		port->is_4k = true;
+		pbuf->for_4k = 1;
 		if (get_cpu_type() >= MESON_CPU_MAJOR_ID_TXLX
 				&& port->vformat == VFORMAT_H264)
 			vdec_poweron(VDEC_HEVC);
 	} else
-		port->is_4k = false;
+		pbuf->for_4k = 0;
 
 	if (port->type & PORT_TYPE_FRAME) {
-		ret = vdec_init(vdec, port->is_4k);
+		ret = vdec_init(vdec, pbuf->for_4k);
 		if (ret < 0) {
-			v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_ERROR, "failed\n");
+			pr_err("video_component_init %d, failed\n", __LINE__);
 			video_component_release(port, pbuf, 2);
 			return ret;
 		}
@@ -318,24 +367,25 @@ static int video_component_init(struct stream_port_s *port,
 		}
 	}
 
-	ret = stbuf_init(pbuf, vdec);
+	ret = stbuf_init(pbuf, vdec, false);
 	if (ret < 0) {
-		v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_ERROR, "stbuf_init failed\n");
+		pr_err("video_component_init %d, stbuf_init failed\n", __LINE__);
 		return ret;
 	}
 
 	/* todo: set path based on port flag */
-	ret = vdec_init(vdec, port->is_4k);
+	ret = vdec_init(vdec, pbuf->for_4k);
 	if (ret < 0) {
-		v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_ERROR, "vdec_init failed\n");
+		pr_err("video_component_init %d, vdec_init failed\n", __LINE__);
 		video_component_release(port, pbuf, 2);
 		return ret;
 	}
 
 	if (vdec_dual(vdec)) {
-		ret = vdec_init(vdec->slave, port->is_4k);
+		ret = vdec_init(vdec->slave, pbuf->for_4k);
 		if (ret < 0) {
-			v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_ERROR, "vdec_init failed\n");
+			pr_err("video_component_init %d, vdec_init failed\n",
+				__LINE__);
 			video_component_release(port, pbuf, 2);
 			return ret;
 		}
@@ -345,7 +395,7 @@ static int video_component_init(struct stream_port_s *port,
 		ret = esparser_init(pbuf, vdec);
 		if (ret < 0) {
 			video_component_release(port, pbuf, 3);
-			v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_ERROR, "esparser_init() failed\n");
+			pr_err("esparser_init() failed\n");
 			return ret;
 		}
 	}
@@ -359,7 +409,14 @@ static int video_component_init(struct stream_port_s *port,
 
 static int vdec_ports_release(struct stream_port_s *port)
 {
+	struct aml_vdec_adapt *ada_ctx
+		= container_of(port, struct aml_vdec_adapt, port);
+	struct vdec_s *vdec = ada_ctx->vdec;
+
 	struct stream_buf_s *pvbuf = &bufs[BUF_TYPE_VIDEO];
+	struct stream_buf_s *pabuf = &bufs[BUF_TYPE_AUDIO];
+	//struct stream_buf_s *psbuf = &bufs[BUF_TYPE_SUBTITLE];
+	struct vdec_s *slave = NULL;
 
 	if (has_hevc_vdec()) {
 		if (port->vformat == VFORMAT_HEVC
@@ -378,6 +435,23 @@ static int vdec_ports_release(struct stream_port_s *port)
 	if (port->type & PORT_TYPE_VIDEO)
 		video_component_release(port, pvbuf, 0);
 
+	if (port->type & PORT_TYPE_AUDIO)
+		audio_component_release(port, pabuf, 0);
+
+	if (port->type & PORT_TYPE_SUB)
+		//sub_port_release(port, psbuf);
+
+	if (vdec) {
+		if (vdec->slave)
+			slave = vdec->slave;
+
+		vdec_release(vdec);
+
+		if (slave)
+			vdec_release(slave);
+		vdec = NULL;
+	}
+
 	port->pcr_inited = 0;
 	port->flag = 0;
 
@@ -389,7 +463,7 @@ static void set_vdec_properity(struct vdec_s *vdec,
 {
 	vdec->sys_info	= &ada_ctx->dec_prop;
 	vdec->port	= &ada_ctx->port;
-	vdec->format	= ada_ctx->video_type;
+	vdec->format	= ada_ctx->dec_prop.format;
 	vdec->sys_info_store = ada_ctx->dec_prop;
 	vdec->vf_receiver_name = ada_ctx->recv_name;
 
@@ -399,25 +473,33 @@ static void set_vdec_properity(struct vdec_s *vdec,
 	/* set video format, sys info and vfm map.*/
 	vdec->port->vformat = vdec->format;
 	vdec->port->type |= PORT_TYPE_VIDEO;
-	vdec->port_flag |= (vdec->port->flag | PORT_FLAG_VFORMAT);
+	vdec->port_flag |= PORT_FLAG_VFORMAT;
 	if (vdec->slave) {
 		vdec->slave->format = ada_ctx->dec_prop.format;
 		vdec->slave->port_flag |= PORT_FLAG_VFORMAT;
 	}
 
-	vdec->type = VDEC_TYPE_FRAME_BLOCK;
-	vdec->port->type |= PORT_TYPE_FRAME;
-	vdec->frame_base_video_path = FRAME_BASE_PATH_V4L_OSD;
+	if (vdec->port->type & PORT_FLAG_DRM) {
+		vdec->type = VDEC_TYPE_STREAM_PARSER;
+		vdec->port->type |= PORT_TYPE_ES;
+		vdec->frame_base_video_path = FRAME_BASE_PATH_V4L_VIDEO;
+	} else {
+		vdec->type = VDEC_TYPE_FRAME_BLOCK;
+		vdec->port->type |= PORT_TYPE_FRAME;
+		vdec->frame_base_video_path = FRAME_BASE_PATH_V4L_OSD;
+	}
 
 	if (aml_set_vdec_type_enable) {
 		if (aml_set_vdec_type == VDEC_TYPE_STREAM_PARSER) {
 			vdec->type = VDEC_TYPE_STREAM_PARSER;
 			vdec->port->type &= ~PORT_TYPE_FRAME;
 			vdec->port->type |= PORT_TYPE_ES;
+			ada_ctx->ctx->is_stream_mode = true;
 		} else if (aml_set_vdec_type == VDEC_TYPE_FRAME_BLOCK) {
 			vdec->type = VDEC_TYPE_FRAME_BLOCK;
 			vdec->port->type &= ~PORT_TYPE_ES;
 			vdec->port->type |= PORT_TYPE_FRAME;
+			ada_ctx->ctx->is_stream_mode = false;
 		}
 	}
 
@@ -426,11 +508,6 @@ static void set_vdec_properity(struct vdec_s *vdec,
 
 	vdec->port->flag = vdec->port_flag;
 	ada_ctx->vfm_path = vdec->frame_base_video_path;
-
-	vdec->config_len = ada_ctx->config.length >
-		PAGE_SIZE ? PAGE_SIZE : ada_ctx->config.length;
-	memcpy(vdec->config, ada_ctx->config.buf, vdec->config_len);
-
 	ada_ctx->vdec = vdec;
 }
 
@@ -438,6 +515,8 @@ static int vdec_ports_init(struct aml_vdec_adapt *ada_ctx)
 {
 	int ret = -1;
 	struct stream_buf_s *pvbuf = &bufs[BUF_TYPE_VIDEO];
+	struct stream_buf_s *pabuf = &bufs[BUF_TYPE_AUDIO];
+	//struct stream_buf_s *psbuf = &bufs[BUF_TYPE_SUBTITLE];
 	struct vdec_s *vdec = NULL;
 
 	/* create the vdec instance.*/
@@ -450,16 +529,25 @@ static int vdec_ports_init(struct aml_vdec_adapt *ada_ctx)
 	/* init hw and gate*/
 	ret = enable_hardware(vdec->port);
 	if (ret < 0) {
-		v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_ERROR, "enable hw fail.\n");
-		return ret;
+		pr_info("enable hw fail.\n");
+		goto error1;
 	}
 
 	stbuf_fetch_init();
 	user_buffer_init();
 
+	if ((vdec->port->type & PORT_TYPE_AUDIO)
+		&& (vdec->port_flag & PORT_FLAG_AFORMAT)) {
+		ret = audio_component_init(vdec->port, pabuf);
+		if (ret < 0) {
+			pr_err("audio_component_init  failed\n");
+			goto error1;
+		}
+	}
+
 	if ((vdec->port->type & PORT_TYPE_VIDEO)
 		&& (vdec->port_flag & PORT_FLAG_VFORMAT)) {
-		vdec->port->is_4k = false;
+		pvbuf->for_4k = 0;
 		if (has_hevc_vdec()) {
 			if (vdec->port->vformat == VFORMAT_HEVC
 				|| vdec->port->vformat == VFORMAT_VP9)
@@ -468,8 +556,8 @@ static int vdec_ports_init(struct aml_vdec_adapt *ada_ctx)
 
 		ret = video_component_init(vdec->port, pvbuf);
 		if (ret < 0) {
-			v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_ERROR, "video_component_init  failed\n");
-			return ret;
+			pr_err("video_component_init  failed\n");
+			goto error2;
 		}
 
 		/* connect vdec at the end after all HW initialization */
@@ -477,6 +565,13 @@ static int vdec_ports_init(struct aml_vdec_adapt *ada_ctx)
 	}
 
 	return 0;
+
+//error3:
+	//video_component_release(port, pvbuf, 0);
+error2:
+	audio_component_release(vdec->port, pabuf, 0);
+error1:
+	return ret;
 }
 
 int video_decoder_init(struct aml_vdec_adapt *vdec)
@@ -489,7 +584,7 @@ int video_decoder_init(struct aml_vdec_adapt *vdec)
 	/* init the buffer work space and connect vdec.*/
 	ret = vdec_ports_init(vdec);
 	if (ret < 0) {
-		v4l_dbg(vdec->ctx, V4L_DEBUG_CODEC_ERROR, "vdec ports init fail.\n");
+		pr_info("vdec ports init fail.\n");
 		goto out;
 	}
 out:
@@ -503,32 +598,20 @@ int video_decoder_release(struct aml_vdec_adapt *vdec)
 
 	ret = vdec_ports_release(port);
 	if (ret < 0) {
-		v4l_dbg(vdec->ctx, V4L_DEBUG_CODEC_ERROR, "vdec ports release fail.\n");
+		pr_info("vdec ports release fail.\n");
 		goto out;
 	}
 
 	/* disable gates */
 	ret = disable_hardware(port);
 	if (ret < 0) {
-		v4l_dbg(vdec->ctx, V4L_DEBUG_CODEC_ERROR, "disable hw fail.\n");
+		pr_info("disable hw fail.\n");
 		goto out;
 	}
 out:
 	return ret;
 }
 
-void dump(const char* path, const char *data, unsigned int size)
-{
-	struct file *fp;
-
-	fp = filp_open(path,
-			O_CREAT | O_RDWR | O_LARGEFILE | O_APPEND, 0600);
-	if (!IS_ERR(fp)) {
-		kernel_write(fp, data, size, 0);
-		filp_close(fp, NULL);
-	}
-
-}
 int vdec_vbuf_write(struct aml_vdec_adapt *ada_ctx,
 	const char *buf, unsigned int count)
 {
@@ -561,85 +644,58 @@ int vdec_vbuf_write(struct aml_vdec_adapt *ada_ctx,
 	} while (ret == -EAGAIN && try_cnt--);
 
 	if (slow_input) {
-		v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_PRINFO,
-			"slow_input: es codec write size %x\n", ret);
+		pr_info("slow_input: es codec write size %x\n", ret);
 		msleep(10);
 	}
 
 #ifdef DATA_DEBUG
 	/* dump to file */
 	//dump_write(vbuf, size);
-	//v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_PRINFO, "vbuf: %p, size: %u, ret: %d\n", vbuf, size, ret);
+	//pr_info("vbuf: %p, size: %u, ret: %d\n", vbuf, size, ret);
 #endif
 
 	return ret;
 }
 
-bool vdec_input_full(struct aml_vdec_adapt *ada_ctx)
+int is_need_to_buf(struct aml_vdec_adapt *ada_ctx)
 {
 	struct vdec_s *vdec = ada_ctx->vdec;
 
-	return (vdec->input.have_frame_num > 600) ? true : false;
+	if (vdec->input.have_frame_num > 8)
+		return 0;
+	else
+		return 1;
 }
 
 int vdec_vframe_write(struct aml_vdec_adapt *ada_ctx,
-	const char *buf, unsigned int count, u64 timestamp)
+	const char *buf, unsigned int count, unsigned long int timestamp)
 {
 	int ret = -1;
+	int try_cnt = 100;
 	struct vdec_s *vdec = ada_ctx->vdec;
 
 	/* set timestamp */
 	vdec_set_timestamp(vdec, timestamp);
 
-	ret = vdec_write_vframe(vdec, buf, count);
+	do {
+		ret = vdec_write_vframe(vdec, buf, count);
+		if (ret == -EAGAIN) {
+			/*vdec_input_level(&vdec->input);*/
+			msleep(30);
+		}
+	} while (ret == -EAGAIN && try_cnt--);
 
 	if (slow_input) {
-		v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_PRINFO,
-			"slow_input: frame codec write size %d\n", ret);
+		pr_info("slow_input: frame codec write size %d\n", ret);
 		msleep(30);
 	}
 
-	if (dump_output_frame > 0) {
-		dump("/data/es.data", buf, count);
-		dump_output_frame--;
-	}
-
-	v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_INPUT,
-		"write frames, vbuf: %p, size: %u, ret: %d, crc: %x, ts: %llu\n",
-		buf, count, ret, crc32_le(0, buf, count), timestamp);
-
-	return ret;
-}
-
-void vdec_vframe_input_free(void *priv, u32 handle)
-{
-	struct aml_vcodec_ctx *ctx = priv;
-
-	aml_recycle_dma_buffers(ctx, handle);
-}
-
-int vdec_vframe_write_with_dma(struct aml_vdec_adapt *ada_ctx,
-	ulong addr, u32 count, u64 timestamp, u32 handle,
-	chunk_free free, void* priv)
-{
-	int ret = -1;
-	struct vdec_s *vdec = ada_ctx->vdec;
-
-	/* set timestamp */
-	vdec_set_timestamp(vdec, timestamp);
-
-	ret = vdec_write_vframe_with_dma(vdec, addr, count,
-		handle, free, priv);
-
-	if (slow_input) {
-		v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_PRINFO,
-			"slow_input: frame codec write size %d\n", ret);
-		msleep(30);
-	}
-
-	v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_INPUT,
-		"write frames, vbuf: %lx, size: %u, ret: %d, ts: %llu\n",
-		addr, count, ret, timestamp);
+#ifdef DATA_DEBUG
+	/* dump to file */
+	dump_write(buf, count);
+#endif
+	aml_v4l2_debug(2, "[%d] write frames, vbuf: %p, size: %u, ret: %d, crc: %x",
+		ada_ctx->ctx->id, buf, count, ret, crc32_le(0, buf, count));
 
 	return ret;
 }
@@ -660,21 +716,13 @@ int aml_codec_reset(struct aml_vdec_adapt *ada_ctx, int *mode)
 	if (vdec) {
 		if (!ada_ctx->ctx->q_data[AML_Q_DATA_SRC].resolution_changed)
 			vdec_set_eos(vdec, false);
+
 		if (*mode == V4L_RESET_MODE_NORMAL &&
-			vdec->input.have_frame_num == 0) {
-			v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_PRINFO,
-			"no input reset mode: %d\n", *mode);
+				vdec->input.have_frame_num == 0) {
+			aml_v4l2_debug(2, "no input reset mode: %d\n", *mode);
 			*mode = V4L_RESET_MODE_LIGHT;
 		}
-		if (ada_ctx->ctx->param_sets_from_ucode &&
-			*mode == V4L_RESET_MODE_NORMAL &&
-			ada_ctx->ctx->q_data[AML_Q_DATA_SRC].resolution_changed == true) {
-			v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_PRINFO,
-			"resolution_changed reset mode: %d\n", *mode);
-			*mode = V4L_RESET_MODE_LIGHT;
-		}
-		v4l_dbg(ada_ctx->ctx, V4L_DEBUG_CODEC_PRINFO,
-			"reset mode: %d\n", *mode);
+		aml_v4l2_debug(1, "reset mode: %d\n", *mode);
 
 		ret = vdec_v4l2_reset(vdec, *mode);
 		*mode = V4L_RESET_MODE_NORMAL;
@@ -707,12 +755,4 @@ int vdec_frame_number(struct aml_vdec_adapt *ada_ctx)
 		return vdec_get_frame_num(vdec);
 	else
 		return -1;
-}
-
-void v4l2_config_vdec_parm(struct aml_vdec_adapt *ada_ctx, u8 *data, u32 len)
-{
-	struct vdec_s *vdec = ada_ctx->vdec;
-
-	vdec->config_len = len > PAGE_SIZE ? PAGE_SIZE : len;
-	memcpy(vdec->config, data, vdec->config_len);
 }

@@ -46,7 +46,6 @@
 #include <linux/amlogic/media/codec_mm/configs.h>
 #include "../utils/firmware.h"
 #include <linux/amlogic/tee.h>
-#include "../utils/config_parser.h"
 
 #define TIME_TASK_PRINT_ENABLE  0x100
 #define PUT_PRINT_ENABLE    0x200
@@ -104,7 +103,6 @@ static const struct vframe_operations_s vh264mvc_vf_provider = {
 
 static struct vframe_provider_s vh264mvc_vf_prov;
 
-static struct vdec_s *vdec = NULL;
 static u32 frame_width, frame_height, frame_dur;
 static u32 saved_resolution;
 static struct timer_list recycle_timer;
@@ -187,11 +185,9 @@ static s32 vh264mvc_init(void);
 unsigned int DECODE_BUFFER_START = 0x00200000;
 unsigned int DECODE_BUFFER_END = 0x05000000;
 
-/* #define DISPLAY_BUFFER_NUM         4 */
-static unsigned int dynamic_buf_num_margin = 8;
-
 #define DECODE_BUFFER_NUM_MAX    16
-#define MAX_BMMU_BUFFER_NUM	(DECODE_BUFFER_NUM_MAX + dynamic_buf_num_margin)
+#define DISPLAY_BUFFER_NUM         4
+#define MAX_BMMU_BUFFER_NUM	(DECODE_BUFFER_NUM_MAX + DISPLAY_BUFFER_NUM)
 #define TOTAL_BMMU_BUFF_NUM     (MAX_BMMU_BUFFER_NUM * 2 + 3)
 #define VF_BUFFER_IDX(n) (2  + n)
 
@@ -227,12 +223,8 @@ struct buffer_spec_s {
 	unsigned long phy_addr;
 	int alloc_count;
 };
-/*
 static struct buffer_spec_s buffer_spec0[MAX_BMMU_BUFFER_NUM];
 static struct buffer_spec_s buffer_spec1[MAX_BMMU_BUFFER_NUM];
-*/
-static struct buffer_spec_s *buffer_spec0;
-static struct buffer_spec_s *buffer_spec1;
 static void *mm_blk_handle;
 
 /*
@@ -749,7 +741,7 @@ static void do_alloc_work(struct work_struct *work)
 					mb_width, mb_height);
 
 		total_dec_frame_buffering[0] =
-			max_dec_frame_buffering[0] + dynamic_buf_num_margin;
+			max_dec_frame_buffering[0] + DISPLAY_BUFFER_NUM;
 
 		mb_width = (mb_width + 3) & 0xfffffffc;
 		mb_height = (mb_height + 3) & 0xfffffffc;
@@ -830,7 +822,7 @@ static void do_alloc_work(struct work_struct *work)
 		}
 
 		total_dec_frame_buffering[1] =
-			max_dec_frame_buffering[1] + dynamic_buf_num_margin;
+			max_dec_frame_buffering[1] + DISPLAY_BUFFER_NUM;
 
 		mb_width = (mb_width + 3) & 0xfffffffc;
 		mb_height = (mb_height + 3) & 0xfffffffc;
@@ -899,13 +891,7 @@ static void vh264mvc_isr(void)
 	struct vframe_s *vf;
 	unsigned int pts, pts_valid = 0;
 	u64 pts_us64;
-	u32 frame_size;
 	int ret = READ_VREG(MAILBOX_COMMAND);
-
-	if (is_support_no_parser()) {
-		STBUF_WRITE(&vdec->vbuf, set_rp,
-			READ_VREG(VLD_MEM_VIFIFO_RP));
-	}
 	/* pr_info("vh264mvc_isr, cmd =%x\n", ret); */
 	switch (ret & 0xff) {
 	case CMD_ALLOC_VIEW_0:
@@ -1038,7 +1024,6 @@ static void vh264mvc_isr(void)
 				if (pts_lookup_offset_us64
 					(PTS_TYPE_VIDEO,
 					 vfpool_idx[slot].stream_offset, &pts,
-					 &frame_size,
 					 0x10000, &pts_us64) == 0)
 					pts_valid = 1;
 				else
@@ -1382,7 +1367,6 @@ static int vh264mvc_local_init(void)
 	max_dec_frame_buffering[1] = -1;
 	fill_ptr = get_ptr = put_ptr = putting_ptr = 0;
 	dirty_frame_num = 0;
-
 	for (i = 0; i < DECODE_BUFFER_NUM_MAX; i++) {
 		view0_vfbuf_use[i] = 0;
 		view1_vfbuf_use[i] = 0;
@@ -1426,6 +1410,7 @@ static s32 vh264mvc_init(void)
 {
 	int ret = -1;
 	char *buf = vmalloc(0x1000 * 16);
+
 	if (buf == NULL)
 		return -ENOMEM;
 
@@ -1595,7 +1580,6 @@ static void error_do_work(struct work_struct *work)
 static int amvdec_h264mvc_probe(struct platform_device *pdev)
 {
 	struct vdec_s *pdata = *(struct vdec_s **)pdev->dev.platform_data;
-	int config_val = 0;
 
 	pr_info("amvdec_h264mvc probe start.\n");
 	mutex_lock(&vh264_mvc_mutex);
@@ -1617,36 +1601,19 @@ static int amvdec_h264mvc_probe(struct platform_device *pdev)
 	if (pdata->sys_info)
 		vh264mvc_amstream_dec_info = *pdata->sys_info;
 
-	if (pdata->config_len) {
-		pr_info("pdata->config: %s\n", pdata->config);
-		if (get_config_int(pdata->config, "parm_v4l_buffer_margin",
-			&config_val) == 0)
-			dynamic_buf_num_margin = config_val;
-	}
-
 	pdata->dec_status = vh264mvc_dec_status;
 	/* pdata->set_trickmode = vh264mvc_set_trickmode; */
-
-	buffer_spec0 = (struct buffer_spec_s *)vzalloc(
-		sizeof(struct buffer_spec_s) * MAX_BMMU_BUFFER_NUM * 2);
-	if (NULL == buffer_spec0)
-		return -ENOMEM;
-	buffer_spec1 = &buffer_spec0[MAX_BMMU_BUFFER_NUM];
 
 	if (vh264mvc_init() < 0) {
 		pr_info("\namvdec_h264mvc init failed.\n");
 		kfree(gvs);
 		gvs = NULL;
-		vfree(buffer_spec0);
-		buffer_spec0 = NULL;
 		mutex_unlock(&vh264_mvc_mutex);
 		return -ENODEV;
 	}
 
 	INIT_WORK(&error_wd_work, error_do_work);
 	INIT_WORK(&set_clk_work, vh264_mvc_set_clk);
-
-	vdec = pdata;
 
 	atomic_set(&vh264mvc_active, 1);
 
@@ -1680,8 +1647,6 @@ static int amvdec_h264mvc_remove(struct platform_device *pdev)
 #ifdef DEBUG_SKIP
 	pr_info("view_total = %ld, dropped %ld\n", view_total, view_dropped);
 #endif
-	vfree(buffer_spec0);
-	buffer_spec0 = NULL;
 	kfree(gvs);
 	gvs = NULL;
 
@@ -1689,32 +1654,16 @@ static int amvdec_h264mvc_remove(struct platform_device *pdev)
 }
 
 /****************************************/
-#ifdef CONFIG_PM
-static int h264mvc_suspend(struct device *dev)
-{
-	amvdec_suspend(to_platform_device(dev), dev->power.power_state);
-	return 0;
-}
-
-static int h264mvc_resume(struct device *dev)
-{
-	amvdec_resume(to_platform_device(dev));
-	return 0;
-}
-
-static const struct dev_pm_ops h264mvc_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(h264mvc_suspend, h264mvc_resume)
-};
-#endif
 
 static struct platform_driver amvdec_h264mvc_driver = {
 	.probe = amvdec_h264mvc_probe,
 	.remove = amvdec_h264mvc_remove,
+#ifdef CONFIG_PM
+	.suspend = amvdec_suspend,
+	.resume = amvdec_resume,
+#endif
 	.driver = {
 		.name = DRIVER_NAME,
-#ifdef CONFIG_PM
-		.pm = &h264mvc_pm_ops,
-#endif
 	}
 };
 
@@ -1722,8 +1671,6 @@ static struct codec_profile_t amvdec_hmvc_profile = {
 	.name = "hmvc",
 	.profile = ""
 };
-static struct codec_profile_t amvdec_hmvc_profile_single;
-
 static struct mconfig h264mvc_configs[] = {
 	MC_PU32("stat", &stat),
 	MC_PU32("dbg_mode", &dbg_mode),
@@ -1744,9 +1691,6 @@ static int __init amvdec_h264mvc_driver_init_module(void)
 	}
 
 	vcodec_profile_register(&amvdec_hmvc_profile);
-	amvdec_hmvc_profile_single = amvdec_hmvc_profile;
-	amvdec_hmvc_profile_single.name = "h264mvc";
-	vcodec_profile_register(&amvdec_hmvc_profile_single);
 	INIT_REG_NODE_CONFIGS("media.decoder", &h264mvc_node,
 		"h264mvc", h264mvc_configs, CONFIG_FOR_RW);
 	return 0;
@@ -1766,9 +1710,6 @@ MODULE_PARM_DESC(stat, "\n amvdec_h264mvc stat\n");
 
 module_param(dbg_mode, uint, 0664);
 MODULE_PARM_DESC(dbg_mode, "\n amvdec_h264mvc dbg mode\n");
-
-module_param(dynamic_buf_num_margin, uint, 0664);
-MODULE_PARM_DESC(dynamic_buf_num_margin, "\n amvdec_h264mvc dynamic_buf_num_margin\n");
 
 module_param(view_mode, uint, 0664);
 MODULE_PARM_DESC(view_mode, "\n amvdec_h264mvc view mode\n");

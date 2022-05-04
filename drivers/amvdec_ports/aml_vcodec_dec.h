@@ -23,7 +23,6 @@
 #include <media/videobuf2-core.h>
 #include <media/videobuf2-v4l2.h>
 #include <linux/amlogic/media/codec_mm/codec_mm.h>
-#include <linux/amlogic/media/video_sink/v4lvideo_ext.h>
 #include "aml_vcodec_util.h"
 
 #define VCODEC_CAPABILITY_4K_DISABLED	0x10
@@ -35,32 +34,20 @@
 #define AML_VDEC_IRQ_STATUS_DEC_SUCCESS	0x10000
 #define V4L2_BUF_FLAG_LAST		0x00100000
 
-#define VDEC_GATHER_MEMORY_TYPE		0
-#define VDEC_SCATTER_MEMORY_TYPE	1
+#define AML_V4L2_SET_DECMODE (V4L2_CID_USER_AMLOGIC_BASE + 0)
 
 /**
  * struct vdec_fb  - decoder frame buffer
- * @mem_type	: gather or scatter memory.
- * @num_planes	: used number of the plane
- * @mem[4]	: array mem for used planes,
- *		  mem[0]: Y, mem[1]: C/U, mem[2]: V
- * @vf_fd	: the file handle of video frame
- * @vf_handle	: video frame handle
+ * @base_y	: Y plane memory info
+ * @base_c	: C plane memory info
  * @status      : frame buffer status (vdec_fb_status)
  */
-
-struct vdec_v4l2_buffer {
-	int	mem_type;
-	int	num_planes;
-	union {
-		struct	aml_vcodec_mem mem[4];
-		u32	vf_fd;
-	} m;
-	ulong	vf_handle;
-	u32	status;
-	u32	buf_idx;
+struct vdec_fb {
+	unsigned long vf_handle;
+	struct aml_vcodec_mem	base_y;
+	struct aml_vcodec_mem	base_c;
+	unsigned int	status;
 };
-
 
 /**
  * struct aml_video_dec_buf - Private data related to each VB2 buffer.
@@ -68,7 +55,6 @@ struct vdec_v4l2_buffer {
  * @list:	link list
  * @used:	Capture buffer contain decoded frame data and keep in
  *			codec data structure
- * @ready_to_display:	Capture buffer not display yet
  * @queued_in_vb2:	Capture buffer is queue in vb2
  * @queued_in_v4l2:	Capture buffer is in v4l2 driver, but not in vb2
  *			queue yet
@@ -82,12 +68,11 @@ struct aml_video_dec_buf {
 	struct vb2_v4l2_buffer vb;
 	struct list_head list;
 
-	struct vdec_v4l2_buffer frame_buffer;
-	struct file_private_data privdata;
+	struct vdec_fb frame_buffer;
 	struct codec_mm_s *mem[2];
 	char mem_onwer[32];
+	struct list_head node;
 	bool used;
-	bool ready_to_display;
 	bool que_in_m2m;
 	bool queued_in_vb2;
 	bool queued_in_v4l2;
@@ -97,6 +82,7 @@ struct aml_video_dec_buf {
 
 extern const struct v4l2_ioctl_ops aml_vdec_ioctl_ops;
 extern const struct v4l2_m2m_ops aml_vdec_m2m_ops;
+
 
 /*
  * aml_vdec_lock/aml_vdec_unlock are for ctx instance to
@@ -111,16 +97,14 @@ int aml_vcodec_dec_queue_init(void *priv, struct vb2_queue *src_vq,
 void aml_vcodec_dec_set_default_params(struct aml_vcodec_ctx *ctx);
 void aml_vcodec_dec_release(struct aml_vcodec_ctx *ctx);
 int aml_vcodec_dec_ctrls_setup(struct aml_vcodec_ctx *ctx);
+
 void vdec_device_vf_run(struct aml_vcodec_ctx *ctx);
+
 void try_to_capture(struct aml_vcodec_ctx *ctx);
 void aml_thread_notify(struct aml_vcodec_ctx *ctx,
 	enum aml_thread_type type);
 int aml_thread_start(struct aml_vcodec_ctx *ctx, aml_thread_func func,
 	enum aml_thread_type type, const char *thread_name);
 void aml_thread_stop(struct aml_vcodec_ctx *ctx);
-void wait_vcodec_ending(struct aml_vcodec_ctx *ctx);
-void vdec_frame_buffer_release(void *data);
-void aml_vdec_dispatch_event(struct aml_vcodec_ctx *ctx, u32 changes);
-void* v4l_get_vf_handle(int fd);
 
 #endif /* _AML_VCODEC_DEC_H_ */

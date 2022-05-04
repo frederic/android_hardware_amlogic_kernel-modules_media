@@ -169,7 +169,6 @@ static irqreturn_t vmjpeg_isr(int irq, void *dev_id)
 	u32 reg, offset, pts, pts_valid = 0;
 	struct vframe_s *vf = NULL;
 	u64 pts_us64;
-	u32 frame_size;
 
 	WRITE_VREG(ASSIST_MBOX1_CLR_REG, 1);
 
@@ -179,8 +178,7 @@ static irqreturn_t vmjpeg_isr(int irq, void *dev_id)
 		offset = READ_VREG(MREG_FRAME_OFFSET);
 
 		if (pts_lookup_offset_us64
-			(PTS_TYPE_VIDEO, offset, &pts,
-			&frame_size, 0, &pts_us64) == 0)
+			(PTS_TYPE_VIDEO, offset, &pts, 0, &pts_us64) == 0)
 			pts_valid = 1;
 
 		if ((reg & PICINFO_INTERLACE) == 0) {
@@ -911,32 +909,16 @@ static int amvdec_mjpeg_remove(struct platform_device *pdev)
 }
 
 /****************************************/
-#ifdef CONFIG_PM
-static int mjpeg_suspend(struct device *dev)
-{
-	amvdec_suspend(to_platform_device(dev), dev->power.power_state);
-	return 0;
-}
-
-static int mjpeg_resume(struct device *dev)
-{
-	amvdec_resume(to_platform_device(dev));
-	return 0;
-}
-
-static const struct dev_pm_ops mjpeg_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(mjpeg_suspend, mjpeg_resume)
-};
-#endif
 
 static struct platform_driver amvdec_mjpeg_driver = {
 	.probe = amvdec_mjpeg_probe,
 	.remove = amvdec_mjpeg_remove,
+#ifdef CONFIG_PM
+	.suspend = amvdec_suspend,
+	.resume = amvdec_resume,
+#endif
 	.driver = {
 		.name = DRIVER_NAME,
-#ifdef CONFIG_PM
-		.pm = &mjpeg_pm_ops,
-#endif
 	}
 };
 

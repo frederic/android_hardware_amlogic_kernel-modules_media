@@ -56,21 +56,7 @@
 static struct vframe_block_list_s *
 	vdec_input_alloc_new_block(struct vdec_input_s *input,
 	ulong phy_addr,
-	int size,
-	chunk_free free,
-	void* priv);
-
-static int aml_copy_from_user(void *to, const void *from, ulong n)
-{
-	int ret =0;
-
-	if (likely(access_ok(VERIFY_READ, from, n)))
-		ret = copy_from_user(to, from, n);
-	else
-		memcpy(to, from, n);
-
-	return ret;
-}
+	int size);
 
 static int copy_from_user_to_phyaddr(void *virts, const char __user *buf,
 		u32 size, ulong phys, u32 pading, bool is_mapped)
@@ -82,7 +68,7 @@ static int copy_from_user_to_phyaddr(void *virts, const char __user *buf,
 	u8 *p = virts;
 
 	if (is_mapped) {
-		if (aml_copy_from_user(p, buf, size))
+		if (copy_from_user(p, buf, size))
 			return -EFAULT;
 
 		if (pading)
@@ -99,7 +85,7 @@ static int copy_from_user_to_phyaddr(void *virts, const char __user *buf,
 		if (!p)
 			return -1;
 
-		if (aml_copy_from_user(p, buf + i * span, span)) {
+		if (copy_from_user(p, buf + i * span, span)) {
 			codec_mm_unmap_phyaddr(p);
 			return -EFAULT;
 		}
@@ -117,7 +103,7 @@ static int copy_from_user_to_phyaddr(void *virts, const char __user *buf,
 	if (!p)
 		return -1;
 
-	if (aml_copy_from_user(p, buf + span, remain)) {
+	if (copy_from_user(p, buf + span, remain)) {
 		codec_mm_unmap_phyaddr(p);
 		return -EFAULT;
 	}
@@ -223,18 +209,10 @@ static void vframe_block_add_chunk(struct vframe_block_list_s *block,
 	block->input->sequence++;
 }
 
-static bool is_coherent_buff = 1;
-
 static void vframe_block_free_block(struct vframe_block_list_s *block)
 {
-	if (is_coherent_buff) {
-		if (block->mem_handle) {
-			codec_mm_dma_free_coherent(block->mem_handle);
-		}
-	} else {
-		if (block->addr) {
-			codec_mm_free_for_dma(MEM_NAME,	block->addr);
-		}
+	if (block->addr) {
+		codec_mm_free_for_dma(MEM_NAME,	block->addr);
 	}
 	/*
 	*pr_err("free block %d, size=%d\n", block->id, block->size);
@@ -245,9 +223,7 @@ static void vframe_block_free_block(struct vframe_block_list_s *block)
 static int vframe_block_init_alloc_storage(struct vdec_input_s *input,
 			struct vframe_block_list_s *block,
 			ulong phy_addr,
-			int size,
-			chunk_free free,
-			void *priv)
+			int size)
 {
 	int alloc_size = input->default_block_size;
 	block->magic = 0x4b434c42;
@@ -262,35 +238,27 @@ static int vframe_block_init_alloc_storage(struct vdec_input_s *input,
 		block->start_virt = NULL;
 		block->start = phy_addr;
 		block->size = size;
-		block->free = free;
-		block->priv = priv;
 	} else {
 		alloc_size = PAGE_ALIGN(alloc_size);
-		if (is_coherent_buff) {
-			block->start_virt = codec_mm_dma_alloc_coherent(&block->mem_handle, &block->addr, alloc_size, MEM_NAME);
-		} else {
-			block->addr = codec_mm_alloc_for_dma_ex(
-				MEM_NAME,
-				alloc_size/PAGE_SIZE,
-				VFRAME_BLOCK_PAGEALIGN,
-				CODEC_MM_FLAGS_DMA_CPU | CODEC_MM_FLAGS_FOR_VDECODER,
-				input->id,
-				block->id);
-		}
+		block->addr = codec_mm_alloc_for_dma_ex(
+			MEM_NAME,
+			alloc_size/PAGE_SIZE,
+			VFRAME_BLOCK_PAGEALIGN,
+			CODEC_MM_FLAGS_DMA_CPU | CODEC_MM_FLAGS_FOR_VDECODER,
+			input->id,
+			block->id);
 
 		if (!block->addr) {
 			pr_err("Input block allocation failed\n");
 			return -ENOMEM;
 		}
 
-		if (!is_coherent_buff)
-			block->start_virt = (void *)codec_mm_phys_to_virt(block->addr);
+		block->start_virt = (void *)codec_mm_phys_to_virt(block->addr);
 		if (block->start_virt)
 			block->is_mapped = true;
 		block->start = block->addr;
 		block->size = alloc_size;
 		block->is_out_buf = 0;
-		block->free = NULL;
 	}
 
 	return 0;
@@ -326,7 +294,7 @@ int vdec_input_prepare_bufs(struct vdec_input_s *input,
 	}
 	/*prepared 3 buffers for smooth start.*/
 	for (i = 0; i < 3; i++) {
-		block = vdec_input_alloc_new_block(input, 0, 0, NULL, NULL);
+		block = vdec_input_alloc_new_block(input, 0, 0);
 		if (!block)
 			break;
 		flags = vdec_input_lock(input);
@@ -436,7 +404,6 @@ int vdec_input_dump_blocks(struct vdec_input_s *input,
 }
 
 static int vdec_input_dump_chunk_locked(
-	int id,
 	struct vframe_chunk_s *chunk,
 	char *buf, int size)
 {
@@ -456,8 +423,7 @@ static int vdec_input_dump_chunk_locked(
 	} while (0)
 
 	BUFPRINT(
-		"\t[%d][%lld:%p]-off=%d,size:%d,p:%d,\tpts64=%lld,addr=%p\n",
-		id,
+		"\t[%lld:%p]-off=%d,size:%d,p:%d,\tpts64=%lld,addr=%p\n",
 		chunk->sequence,
 		chunk->block,
 		chunk->offset,
@@ -477,7 +443,7 @@ static int vdec_input_dump_chunk_locked(
 	return tsize;
 }
 
-int vdec_input_dump_chunks(int id, struct vdec_input_s *input,
+int vdec_input_dump_chunks(struct vdec_input_s *input,
 	char *bufs, int size)
 {
 
@@ -486,15 +452,12 @@ int vdec_input_dump_chunks(int id, struct vdec_input_s *input,
 	char *lbuf = bufs;
 	char sbuf[256];
 	int s = 0;
-	int i = 0;
-
 	if (size <= 0)
 		return 0;
 	if (!bufs)
 		lbuf = sbuf;
-	s = snprintf(lbuf + s, size - s,
-		"[%d]blocks:vdec-%d id:%d,bufsize=%d,dsize=%d,frames:%d,maxframe:%d\n",
-		id,
+	snprintf(lbuf + s, size - s,
+		"blocks:vdec-%d id:%d,bufsize=%d,dsize=%d,frames:%d,maxframe:%d\n",
 		input->id,
 		input->block_nums,
 		input->size,
@@ -514,10 +477,7 @@ int vdec_input_dump_chunks(int id, struct vdec_input_s *input,
 				p, struct vframe_chunk_s, list);
 		if (bufs != NULL)
 			lbuf = bufs + s;
-		s += vdec_input_dump_chunk_locked(id, chunk, lbuf, size - s);
-		i++;
-		if (i >= 10)
-			break;
+		s += vdec_input_dump_chunk_locked(chunk, lbuf, size - s);
 	}
 	vdec_input_unlock(input, flags);
 	return s;
@@ -538,15 +498,16 @@ int vdec_input_set_buffer(struct vdec_input_s *input, u32 start, u32 size)
 		input->swap_page_phys = codec_mm_alloc_for_dma("SWAP",
 			1, 0, CODEC_MM_FLAGS_TVP);
 	else {
-		input->swap_page = codec_mm_dma_alloc_coherent(&input->mem_handle,
-				(ulong *)&input->swap_page_phys,
-				PAGE_SIZE, MEM_NAME);
-		if (input->swap_page == NULL)
-			return -ENOMEM;
+		input->swap_page = alloc_page(GFP_KERNEL);
+		if (input->swap_page) {
+			input->swap_page_phys =
+				page_to_phys(input->swap_page);
+		}
 	}
 
 	if (input->swap_page_phys == 0)
 		return -ENOMEM;
+
 	return 0;
 }
 EXPORT_SYMBOL(vdec_input_set_buffer);
@@ -624,9 +585,7 @@ EXPORT_SYMBOL(vdec_input_level);
 static struct vframe_block_list_s *
 	vdec_input_alloc_new_block(struct vdec_input_s *input,
 	ulong phy_addr,
-	int size,
-	chunk_free free,
-	void* priv)
+	int size)
 {
 	struct vframe_block_list_s *block;
 	block = kzalloc(sizeof(struct vframe_block_list_s),
@@ -638,7 +597,7 @@ static struct vframe_block_list_s *
 	}
 
 	if (vframe_block_init_alloc_storage(input,
-		block, phy_addr, size, free, priv) != 0) {
+		block, phy_addr, size) != 0) {
 		kfree(block);
 		pr_err("vframe_block storage allocation failed\n");
 		return NULL;
@@ -769,7 +728,7 @@ static int	vdec_input_get_free_block(
 		/*128k aligned,same as codec_mm*/
 		input->default_block_size = def_size;
 	}
-	block = vdec_input_alloc_new_block(input, 0, 0, NULL, NULL);
+	block = vdec_input_alloc_new_block(input, 0, 0);
 	if (!block) {
 		input->no_mem_err_cnt++;
 		return -EAGAIN;
@@ -779,19 +738,25 @@ static int	vdec_input_get_free_block(
 	return 0;
 }
 
+static void *virt_mem = NULL;
+static u32 virt_mem_size = (SZ_1M * 2);
+static u32 inoffset = 0;
+static u32 trig_error_data = 0;
+
 int vdec_input_add_chunk(struct vdec_input_s *input, const char *buf,
-		size_t count, u32 handle, chunk_free free, void* priv)
+		size_t count, u32 handle)
 {
 	unsigned long flags;
 	struct vframe_chunk_s *chunk;
 	struct vdec_s *vdec = input->vdec;
 	struct vframe_block_list_s *block;
+	int crc = 0;
+
 	int need_pading_size = MIN_FRAME_PADDING_SIZE;
 
 	if (vdec_secure(vdec)) {
 		block = vdec_input_alloc_new_block(input, (ulong)buf,
-			PAGE_ALIGN(count + HEVC_PADDING_SIZE + 1),
-			free, priv); /*Add padding large than HEVC_PADDING_SIZE */
+			PAGE_ALIGN(count + HEVC_PADDING_SIZE + 1)); /*Add padding large than HEVC_PADDING_SIZE */
 		if (!block)
 			return -ENOMEM;
 		block->handle = handle;
@@ -835,6 +800,27 @@ int vdec_input_add_chunk(struct vdec_input_s *input, const char *buf,
 #endif
 		if (input_stream_based(input))
 			return -EINVAL;
+
+		if (!virt_mem) {
+			virt_mem = vmalloc(virt_mem_size);
+			if (!virt_mem)
+				pr_info("%s, vmalloc buffer failed\n", __func__);
+		}
+
+		if (virt_mem) {
+			if (count < virt_mem_size) {
+				int r = copy_from_user(virt_mem, (void *)buf, count);
+				if (r)
+					pr_info("%s copy_from_user failed\n", __func__);
+				inoffset += count;
+				crc = 0;
+				crc = crc32_le(crc, virt_mem, count);
+				//pr_info("[INPUT] crc: %x, size: %zx, offset: %x\n", crc, count, inoffset);
+			} else {
+				pr_info("%s, count(%zx) > virt_mem_size(%x)\n", __func__, count, virt_mem_size);
+			}
+		}
+		count -= trig_error_data;
 
 		if (count < PAGE_SIZE) {
 			need_pading_size = PAGE_ALIGN(count + need_pading_size) -
@@ -886,26 +872,6 @@ int vdec_input_add_chunk(struct vdec_input_s *input, const char *buf,
 		return -ENOMEM;
 	}
 
-	if ((vdec->hdr10p_data_valid == true) &&
-		(vdec->hdr10p_data_size != 0)) {
-		char *new_buf;
-		new_buf = vzalloc(vdec->hdr10p_data_size);
-		if (new_buf) {
-			memcpy(new_buf, vdec->hdr10p_data_buf, vdec->hdr10p_data_size);
-			chunk->hdr10p_data_buf = new_buf;
-			chunk->hdr10p_data_size = vdec->hdr10p_data_size;
-		} else {
-			pr_err("%s:hdr10p data vzalloc size(%d) failed\n",
-				__func__, vdec->hdr10p_data_size);
-			chunk->hdr10p_data_buf = NULL;
-			chunk->hdr10p_data_size = 0;
-		}
-	} else {
-		chunk->hdr10p_data_buf = NULL;
-		chunk->hdr10p_data_size = 0;
-	}
-	vdec->hdr10p_data_valid = false;
-
 	chunk->magic = 0x4b554843;
 	if (vdec->pts_valid) {
 		chunk->pts = vdec->pts;
@@ -955,9 +921,6 @@ int vdec_input_add_chunk(struct vdec_input_s *input, const char *buf,
 	list_add_tail(&chunk->list, &input->vframe_chunk_list);
 	input->data_size += chunk->size;
 	input->have_frame_num++;
-
-	if (input->have_frame_num == 1)
-		input->vdec_up(vdec);
 	ATRACE_COUNTER(MEM_NAME, input->have_frame_num);
 	if (chunk->pts_valid) {
 		input->last_inpts_u64 = chunk->pts64;
@@ -975,7 +938,7 @@ int vdec_input_add_chunk(struct vdec_input_s *input, const char *buf,
 		input->total_wr_count += 38;
 #endif
 
-	return count;
+	return (count + trig_error_data);
 }
 
 int vdec_input_add_frame(struct vdec_input_s *input, const char *buf,
@@ -985,6 +948,7 @@ int vdec_input_add_frame(struct vdec_input_s *input, const char *buf,
 	struct drm_info drm;
 	struct vdec_s *vdec = input->vdec;
 	unsigned long phy_buf;
+	unsigned long flags;
 
 	if (vdec_secure(vdec)) {
 		while (count > 0) {
@@ -996,7 +960,7 @@ int vdec_input_add_frame(struct vdec_input_s *input, const char *buf,
 				return -EIO; /*must drm info v2 version*/
 			phy_buf = (unsigned long) drm.drm_phy;
 			vdec_input_add_chunk(input, (char *)phy_buf,
-				(size_t)drm.drm_pktsize, drm.handle, NULL, NULL);
+				(size_t)drm.drm_pktsize, drm.handle);
 			count -= sizeof(struct drm_info);
 			ret += sizeof(struct drm_info);
 
@@ -1006,23 +970,16 @@ int vdec_input_add_frame(struct vdec_input_s *input, const char *buf,
 				vdec->pts_valid = true;
 		}
 	} else {
-		ret = vdec_input_add_chunk(input, buf, count, 0, NULL, NULL);
+		ret = vdec_input_add_chunk(input, buf, count, 0);
 	}
-
+	flags = vdec_input_lock(input);
+	if ((input->have_frame_num == 1) &&
+		input->vdec_is_input_frame_empty(vdec))
+		input->vdec_up(vdec);
+	vdec_input_unlock(input, flags);
 	return ret;
 }
 EXPORT_SYMBOL(vdec_input_add_frame);
-
-int vdec_input_add_frame_with_dma(struct vdec_input_s *input, ulong addr,
-	size_t count, u32 handle, chunk_free free, void* priv)
-{
-	struct vdec_s *vdec = input->vdec;
-
-	return vdec_secure(vdec) ?
-		vdec_input_add_chunk(input,
-			(char *)addr, count, handle, free, priv) : -1;
-}
-EXPORT_SYMBOL(vdec_input_add_frame_with_dma);
 
 struct vframe_chunk_s *vdec_input_next_chunk(struct vdec_input_s *input)
 {
@@ -1062,25 +1019,10 @@ EXPORT_SYMBOL(vdec_input_next_input_chunk);
 void vdec_input_release_chunk(struct vdec_input_s *input,
 			struct vframe_chunk_s *chunk)
 {
-	struct vframe_chunk_s *p;
-	u32 chunk_valid = 0;
 	unsigned long flags;
 	struct vframe_block_list_s *block = chunk->block;
 	struct vframe_block_list_s *tofreeblock = NULL;
 	flags = vdec_input_lock(input);
-
-	list_for_each_entry(p, &input->vframe_chunk_list, list) {
-		if (p == chunk) {
-			chunk_valid = 1;
-			break;
-		}
-	}
-	/* 2 threads go here, the other done the deletion,so return*/
-	if (chunk_valid == 0) {
-		vdec_input_unlock(input, flags);
-		pr_err("%s chunk is deleted,so return.\n", __func__);
-		return;
-	}
 
 	list_del(&chunk->list);
 	input->have_frame_num--;
@@ -1100,11 +1042,6 @@ void vdec_input_release_chunk(struct vdec_input_s *input,
 	if (block->is_out_buf) {
 		list_move_tail(&block->list,
 			&input->vframe_block_free_list);
-		if (block->free) {
-			vdec_input_del_block_locked(input, block);
-			block->free(block->priv, block->handle);
-			kfree(block);
-		}
 	} else if (block->chunk_count == 0 &&
 		input->wr_block != block ) {/*don't free used block*/
 		if (block->size < input->default_block_size) {
@@ -1164,15 +1101,14 @@ void vdec_input_release(struct vdec_input_s *input)
 	}
 
 	/* release swap pages */
-	if (vdec_secure(input->vdec)) {
-		if (input->swap_page_phys)
+	if (input->swap_page_phys) {
+		if (vdec_secure(input->vdec))
 			codec_mm_free_for_dma("SWAP", input->swap_page_phys);
-	} else {
-		if (input->swap_page)
-			codec_mm_dma_free_coherent(input->mem_handle);
+		else
+			__free_page(input->swap_page);
+		input->swap_page = NULL;
+		input->swap_page_phys = 0;
 	}
-	input->swap_page = NULL;
-	input->swap_page_phys = 0;
 	input->swap_valid = false;
 }
 EXPORT_SYMBOL(vdec_input_release);
@@ -1188,21 +1124,14 @@ u32 vdec_input_get_freed_handle(struct vdec_s *vdec)
 		return 0;
 
 	flags = vdec_input_lock(input);
-	do {
-		block = list_first_entry_or_null(&input->vframe_block_free_list,
+	block = list_first_entry_or_null(&input->vframe_block_free_list,
 		struct vframe_block_list_s, list);
-		if (!block) {
-			break;
-		}
 
+	if (block) {
 		handle = block->handle;
 		vdec_input_del_block_locked(input, block);
-		if (block->free)
-			block->free(block->priv, handle);
 		kfree(block);
-
-	} while(!handle);
-
+	}
 	vdec_input_unlock(input, flags);
 	return handle;
 }

@@ -17,7 +17,7 @@
 
 #ifndef AMPORTS_PRIV_HEAD_HH
 #define AMPORTS_PRIV_HEAD_HH
-#include "../amports/streambuf.h"
+#include "../parser/streambuf.h"
 #include "../../common/media_clock/switch/amports_gate.h"
 #include <linux/amlogic/media/vfm/vframe.h>
 #include <linux/amlogic/media/registers/register.h>
@@ -50,7 +50,5 @@ void amstream_wakeup_userdata_poll(struct vdec_s *vdec);
 
 struct device *amports_get_dma_device(void);
 struct device *get_codec_cma_device(void);
-
-void amstream_wakeup_fcc_poll(struct vdec_s *vdec);
 
 #endif

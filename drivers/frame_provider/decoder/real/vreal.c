@@ -41,8 +41,8 @@
 #include <linux/amlogic/media/utils/vdec_reg.h>
 #include "../utils/amvdec.h"
 
-#include "../../../stream_input/amports/streambuf.h"
-#include "../../../stream_input/amports/streambuf_reg.h"
+#include "../../../stream_input/parser/streambuf.h"
+#include "../../../stream_input/parser/streambuf_reg.h"
 #include "../../../stream_input/parser/rmparser.h"
 
 #include "vreal.h"
@@ -945,12 +945,12 @@ static int amvdec_real_probe(struct platform_device *pdev)
 	pdata->set_isreset = vreal_set_isreset;
 	is_reset = 0;
 
-	INIT_WORK(&set_clk_work, vreal_set_clk);
 	if (vreal_init(pdata) < 0) {
 		pr_info("amvdec_real init failed.\n");
 		pdata->dec_status = NULL;
 		return -ENODEV;
 	}
+	INIT_WORK(&set_clk_work, vreal_set_clk);
 	return 0;
 }
 
@@ -1001,32 +1001,16 @@ static int amvdec_real_remove(struct platform_device *pdev)
 }
 
 /****************************************/
-#ifdef CONFIG_PM
-static int real_suspend(struct device *dev)
-{
-	amvdec_suspend(to_platform_device(dev), dev->power.power_state);
-	return 0;
-}
-
-static int real_resume(struct device *dev)
-{
-	amvdec_resume(to_platform_device(dev));
-	return 0;
-}
-
-static const struct dev_pm_ops real_pm_ops = {
-	SET_SYSTEM_SLEEP_PM_OPS(real_suspend, real_resume)
-};
-#endif
 
 static struct platform_driver amvdec_real_driver = {
 	.probe = amvdec_real_probe,
 	.remove = amvdec_real_remove,
+#ifdef CONFIG_PM
+	.suspend = amvdec_suspend,
+	.resume = amvdec_resume,
+#endif
 	.driver = {
 		.name = DRIVER_NAME,
-#ifdef CONFIG_PM
-		.pm = &real_pm_ops,
-#endif
 	}
 };
 

@@ -61,9 +61,6 @@ static enum AM_MESON_CPU_MAJOR_ID cpu_ver_info[AM_MESON_CPU_MAJOR_ID_MAX - MAJOR
 	AM_MESON_CPU_MAJOR_ID_RES_0x2d,
 	AM_MESON_CPU_MAJOR_ID_TL1,
 	AM_MESON_CPU_MAJOR_ID_TM2,
-	AM_MESON_CPU_MAJOR_ID_RES_0x30,
-	AM_MESON_CPU_MAJOR_ID_RES_0x31,
-	AM_MESON_CPU_MAJOR_ID_SC2,
 };
 
 static const struct of_device_id cpu_ver_of_match[] = {
@@ -109,10 +106,6 @@ static const struct of_device_id cpu_ver_of_match[] = {
 	{
 		.compatible = "amlogic, cpu-major-id-tm2",
 		.data = &cpu_ver_info[AM_MESON_CPU_MAJOR_ID_TM2 - MAJOR_ID_START],
-	},
-	{
-		.compatible = "amlogic, cpu-major-id-sc2",
-		.data = &cpu_ver_info[AM_MESON_CPU_MAJOR_ID_SC2 - MAJOR_ID_START],
 	},
 	{},
 };
@@ -166,11 +159,3 @@ enum AM_MESON_CPU_MAJOR_ID get_cpu_major_id(void)
 	return cpu_ver_id;
 }
 EXPORT_SYMBOL(get_cpu_major_id);
-
-bool is_cpu_tm2_revb(void)
-{
-	return ((get_cpu_major_id() == AM_MESON_CPU_MAJOR_ID_TM2) &&
-		(is_meson_rev_b()));
-}
-EXPORT_SYMBOL(is_cpu_tm2_revb);
-

@@ -23,28 +23,21 @@
 #include "aml_vcodec_drv.h"
 #include "aml_vcodec_dec.h"
 #include "aml_vcodec_util.h"
-#include "../stream_input/amports/streambuf.h"
+#include "../stream_input/parser/streambuf.h"
 
-#define AML_VIDEO_MAGIC CODEC_MODE('A', 'M', 'L', 'V')
-
-#define V4L_STREAM_TYPE_MATEDATA	(0)
-#define V4L_STREAM_TYPE_FRAME		(1)
+#define NORe CODEC_MODE('N', 'O', 'R', 'e') // normal es
+#define NORn CODEC_MODE('N', 'O', 'R', 'n') // normal nalu
+#define DRMe CODEC_MODE('D', 'R', 'M', 'e') // drm es
+#define DRMn CODEC_MODE('D', 'R', 'M', 'n') // drm nalu
 
 struct stream_info {
-	u32 stream_width;
-	u32 stream_height;
-	u32 stream_field;
-	u32 stream_dpb;
-};
-
-struct aml_video_stream {
 	u32 magic;
 	u32 type;
 	union {
-		struct stream_info s;
-		u8 buf[64];
+		struct drm_info drm;
+		u8 buf[128];
 	} m;
-	u32 len;
+	u32 length;
 	u8 data[0];
 };
 
@@ -75,18 +68,7 @@ enum vdec_get_param_type {
 	GET_PARAM_FREE_FRAME_BUFFER,
 	GET_PARAM_PIC_INFO,
 	GET_PARAM_CROP_INFO,
-	GET_PARAM_DPB_SIZE,
-	GET_PARAM_CONFIG_INFO
-};
-
-/*
- * SET_PARAM_PS_INFO	       : set picture parms, data parsed from ucode.
- */
-enum vdec_set_param_type {
-	SET_PARAM_WRITE_FRAME_SYNC,
-	SET_PARAM_PS_INFO,
-	SET_PARAM_HDR_INFO,
-	SET_PARAM_POST_EVENT
+	GET_PARAM_DPB_SIZE
 };
 
 /**
@@ -129,8 +111,8 @@ void vdec_if_deinit(struct aml_vcodec_ctx *ctx);
  *
  * Return: 0 on success. -EIO on unrecoverable error.
  */
-int vdec_if_decode(struct aml_vcodec_ctx *ctx,
-		   struct aml_vcodec_mem *bs, bool *res_chg);
+int vdec_if_decode(struct aml_vcodec_ctx *ctx, struct aml_vcodec_mem *bs,
+			unsigned long int timestamp, bool *res_chg);
 
 /**
  * vdec_if_get_param() - get driver's parameter
